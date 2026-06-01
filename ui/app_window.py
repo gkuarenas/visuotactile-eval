@@ -76,7 +76,7 @@ class AppWindow(ctk.CTk):
         # Row 3 — gate / threshold sliders
         slider_frame2 = ctk.CTkFrame(self)
         slider_frame2.grid(row=3, column=0, sticky="ew", **pad)
-        self._add_slider(slider_frame2, "Gate px", 20, 300, 100, self._on_gate_slider, col=0)
+        self._add_slider(slider_frame2, "Gate px", 20, 400, 200, self._on_gate_slider, col=0)
         self._add_slider(slider_frame2, "Threshold", 1, 255, 100, self._on_thresh_slider, col=3)
 
         # Row 4 — morphology checkboxes

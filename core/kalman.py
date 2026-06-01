@@ -63,6 +63,4 @@ class KalmanManager:
 
     def mark_autofilled(self, marker_id: int) -> None:
         s = self.states[marker_id]
-        s.x[0] = s.baseline_pos[0]
-        s.x[1] = s.baseline_pos[1]
         s.autofilled = True

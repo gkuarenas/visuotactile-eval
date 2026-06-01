@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+_MAX_VIS_PX = 50.0
+
 from core.tracker import MarkerRecord
 
 
@@ -18,9 +20,20 @@ def draw_overlay(
         by = int(r.y - r.dy)
 
         if session_active:
-            ex = int(bx + r.dx * 2)
-            ey = int(by + r.dy * 2)
-            cv2.arrowedLine(out, (bx, by), (ex, ey), (255, 80, 0), 1, tipLength=0.3)
+            mag = float(np.hypot(r.dx, r.dy))
+            if mag >= 1.0:
+                scale = min(1.0, _MAX_VIS_PX / mag)
+                ex = int(bx + r.dx * scale)
+                ey = int(by + r.dy * scale)
+                tip_len = min(0.4, 10.0 / max(mag * scale, 1.0))
+                if mag < 30:
+                    color = (255, 80, 0)    # blue   — small
+                elif mag < 80:
+                    color = (0, 140, 255)   # orange — medium
+                else:
+                    color = (0, 0, 255)     # red    — large
+                cv2.arrowedLine(out, (bx, by), (ex, ey), color, 1, tipLength=tip_len)
+            cv2.circle(out, (cx, cy), 3, (200, 200, 200), 1)
         else:
             color = (0, 200, 0) if not r.autofilled else (0, 200, 255)
             cv2.circle(out, (cx, cy), 6, color, 1)

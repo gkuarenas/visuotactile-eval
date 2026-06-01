@@ -40,7 +40,7 @@ class Tracker:
         self._calib_h: int = h
 
         self.kalman = KalmanManager()
-        self.gate_px: float = 100.0
+        self.gate_px: float = 200.0
         self.params: dict = default_params()
         self.baseline_set: bool = False
         self.frame_index: int = 0
@@ -92,7 +92,7 @@ class Tracker:
                 x, y, area = det[0], det[1], det[2]
             else:
                 self.kalman.mark_autofilled(sid)
-                x, y, area = s.baseline_pos[0], s.baseline_pos[1], s.baseline_area
+                x, y, area = float(s.x[0]), float(s.x[1]), s.baseline_area
 
             bx, by = s.baseline_pos
             records.append(MarkerRecord(
