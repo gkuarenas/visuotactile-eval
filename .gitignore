@@ -43,6 +43,8 @@ desktop.ini
 *.ipynb
 
 # ── Captured data / outputs ───────────────────────────────────────────────────
+output/sessions/
+docs/
 *.avi
 *.mp4
 *.mkv
