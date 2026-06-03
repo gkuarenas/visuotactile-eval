@@ -26,12 +26,13 @@ def draw_overlay(
                 ex = int(bx + r.dx * scale)
                 ey = int(by + r.dy * scale)
                 tip_len = min(0.4, 10.0 / max(mag * scale, 1.0))
-                if mag < 30:
-                    color = (255, 80, 0)    # blue   — small
-                elif mag < 80:
-                    color = (0, 140, 255)   # orange — medium
+                mag_mm = r.magnitude_mm
+                if mag_mm < 1.5:
+                    color = (255, 80, 0)    # blue   — small   (< 1.5 mm)
+                elif mag_mm < 4.0:
+                    color = (0, 140, 255)   # orange — medium  (1.5–4.0 mm)
                 else:
-                    color = (0, 0, 255)     # red    — large
+                    color = (0, 0, 255)     # red    — large   (>= 4.0 mm)
                 cv2.arrowedLine(out, (bx, by), (ex, ey), color, 1, tipLength=tip_len)
             cv2.circle(out, (cx, cy), 3, (200, 200, 200), 1)
         else:

@@ -9,7 +9,8 @@ from core.tracker import MarkerRecord
 COLUMNS = [
     "frame", "timestamp_ms", "marker_id",
     "x", "y", "area", "dx", "dy", "dA",
-    "magnitude", "predicted_x", "predicted_y", "autofilled",
+    "magnitude", "dx_mm", "dy_mm", "delta_z_mm", "magnitude_mm",
+    "predicted_x", "predicted_y", "autofilled",
 ]
 
 
@@ -45,6 +46,10 @@ class CSVWriter:
                 "dy": round(r.dy, 3),
                 "dA": round(r.dA, 3),
                 "magnitude": round(r.magnitude, 3),
+                "dx_mm": round(r.dx_mm, 4),
+                "dy_mm": round(r.dy_mm, 4),
+                "delta_z_mm": round(r.delta_z_mm, 4),
+                "magnitude_mm": round(r.magnitude_mm, 4),
                 "predicted_x": round(r.predicted_x, 3),
                 "predicted_y": round(r.predicted_y, 3),
                 "autofilled": r.autofilled,

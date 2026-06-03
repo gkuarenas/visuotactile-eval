@@ -7,6 +7,7 @@ import numpy as np
 from core.detector import default_params, preprocess, detect
 from core.kalman import KalmanManager
 from core.hungarian import assign
+from core import zdisplacement
 
 
 @dataclass
@@ -19,6 +20,10 @@ class MarkerRecord:
     dy: float
     dA: float
     magnitude: float
+    dx_mm: float
+    dy_mm: float
+    delta_z_mm: float
+    magnitude_mm: float
     predicted_x: float
     predicted_y: float
     autofilled: bool
@@ -32,6 +37,8 @@ class Tracker:
         K = np.array(data["K"], dtype=float)
         D = np.array(data["D"], dtype=float)    # shape (4,1) — already correct for cv2.fisheye
         w, h = data["image_size"]               # [width, height] — width is index 0
+        self._fx: float = float(K[0, 0])
+        self._fy: float = float(K[1, 1])
 
         self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(
             K, D, np.eye(3), K, (w, h), cv2.CV_16SC2
@@ -95,15 +102,24 @@ class Tracker:
                 x, y, area = float(s.x[0]), float(s.x[1]), s.baseline_area
 
             bx, by = s.baseline_pos
+            dx_px = x - bx
+            dy_px = y - by
+            dx_mm, dy_mm, delta_z_mm = zdisplacement.compute(
+                dx_px, dy_px, s.baseline_area, area, self._fx, self._fy
+            )
             records.append(MarkerRecord(
                 marker_id=sid,
                 x=x,
                 y=y,
                 area=area,
-                dx=x - bx,
-                dy=y - by,
+                dx=dx_px,
+                dy=dy_px,
                 dA=area - s.baseline_area,
-                magnitude=float(np.hypot(x - bx, y - by)),
+                magnitude=float(np.hypot(dx_px, dy_px)),
+                dx_mm=dx_mm,
+                dy_mm=dy_mm,
+                delta_z_mm=delta_z_mm,
+                magnitude_mm=float(np.sqrt(dx_mm**2 + dy_mm**2 + delta_z_mm**2)),
                 predicted_x=float(predicted_xy[0]),
                 predicted_y=float(predicted_xy[1]),
                 autofilled=s.autofilled,
