@@ -27,6 +27,11 @@ class AppWindow(ctk.CTk):
         self._last_annotated: np.ndarray | None = None
         self._video_path: str | None = None
 
+        self._win_active: bool = False
+        self._win_total_frames: int = 0
+        self._win_frames_recorded: int = 0
+        self._win_meta: tuple[int, float, str] | None = None
+
         self._build_ui()
         self._frame_loop()
 
@@ -92,9 +97,54 @@ class AppWindow(ctk.CTk):
         ctk.CTkCheckBox(morph_frame, text="Dilate", variable=self._dilate_var,
                         command=self._on_morph_change).pack(side="left", padx=8)
 
-        # Row 5 — action buttons
+        # Row 5 — window recording panel
+        win_frame = ctk.CTkFrame(self)
+        win_frame.grid(row=5, column=0, sticky="ew", **pad)
+
+        ctk.CTkLabel(win_frame, text="Window Recording", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=8, padx=8, pady=(4, 2), sticky="w"
+        )
+
+        ctk.CTkLabel(win_frame, text="Rep:").grid(row=1, column=0, padx=(8, 2), sticky="e")
+        self.rep_entry = ctk.CTkEntry(win_frame, width=48, state="disabled")
+        self.rep_entry.grid(row=1, column=1, padx=(0, 8))
+        self.rep_entry.insert(0, "1")
+
+        ctk.CTkLabel(win_frame, text="Force (N):").grid(row=1, column=2, padx=(8, 2), sticky="e")
+        self.force_entry = ctk.CTkEntry(win_frame, width=60, state="disabled")
+        self.force_entry.grid(row=1, column=3, padx=(0, 8))
+        self.force_entry.insert(0, "0.0")
+
+        ctk.CTkLabel(win_frame, text="Duration (s):").grid(row=1, column=4, padx=(8, 2), sticky="e")
+        self.duration_entry = ctk.CTkEntry(win_frame, width=60, state="disabled")
+        self.duration_entry.grid(row=1, column=5, padx=(0, 8))
+        self.duration_entry.insert(0, "5.0")
+
+        self.window_seg = ctk.CTkSegmentedButton(
+            win_frame, values=["loaded", "unloaded"], state="disabled"
+        )
+        self.window_seg.set("loaded")
+        self.window_seg.grid(row=1, column=6, padx=8)
+
+        btn_sub = ctk.CTkFrame(win_frame, fg_color="transparent")
+        btn_sub.grid(row=1, column=7, padx=8)
+        self.record_btn = ctk.CTkButton(btn_sub, text="Record", width=80,
+                                        state="disabled", command=self._on_record)
+        self.record_btn.pack(side="left", padx=4)
+        self.stop_btn = ctk.CTkButton(btn_sub, text="Stop", width=70,
+                                      state="disabled", command=self._on_stop)
+        self.stop_btn.pack(side="left", padx=4)
+
+        self.progress_bar = ctk.CTkProgressBar(win_frame, width=200)
+        self.progress_bar.set(0.0)
+        self.progress_bar.grid(row=2, column=0, columnspan=6, padx=8, pady=(4, 4), sticky="w")
+
+        self.timer_label = ctk.CTkLabel(win_frame, text="Frames captured: —", width=180, anchor="w")
+        self.timer_label.grid(row=2, column=6, columnspan=2, padx=8, sticky="w")
+
+        # Row 6 — action buttons
         btn_frame = ctk.CTkFrame(self)
-        btn_frame.grid(row=5, column=0, **pad)
+        btn_frame.grid(row=6, column=0, **pad)
         ctk.CTkButton(btn_frame, text="Capture Baseline", command=self._on_capture_baseline
                       ).pack(side="left", padx=6)
         self._start_btn = ctk.CTkButton(btn_frame, text="Start Session",
@@ -104,10 +154,10 @@ class AppWindow(ctk.CTk):
                                        command=self._on_stop_session, state="disabled")
         self._stop_btn.pack(side="left", padx=6)
 
-        # Row 6 — status bar
+        # Row 7 — status bar
         self._status_var = ctk.StringVar(value="Select a video source to begin")
         self._status_bar = ctk.CTkLabel(self, textvariable=self._status_var, anchor="w")
-        self._status_bar.grid(row=6, column=0, sticky="ew", **pad)
+        self._status_bar.grid(row=7, column=0, sticky="ew", **pad)
 
     def _add_slider(
         self,
@@ -173,7 +223,6 @@ class AppWindow(ctk.CTk):
         if self.cap is not None and self.cap.isOpened():
             ret, frame = self.cap.read()
             if not ret:
-                # Loop video file back to start
                 if self._src_var.get() == "Video File":
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret, frame = self.cap.read()
@@ -187,8 +236,12 @@ class AppWindow(ctk.CTk):
                         self.session is not None,
                         self.tracker.frame_index,
                     )
-                    if self.session is not None:
-                        self.session.write_rows(records, self.tracker.frame_index)
+                    if self.session is not None and self._win_active:
+                        self.session.buffer_frame(records, self.tracker.frame_index)
+                        self._win_frames_recorded += 1
+                        self._update_window_progress()
+                        if self._win_frames_recorded >= self._win_total_frames:
+                            self._complete_window()
                 else:
                     annotated = undistorted
 
@@ -226,11 +279,14 @@ class AppWindow(ctk.CTk):
         self.tracker.frame_index = 0
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
+        self._enable_window_widgets()
         self._status_var.set(f"Recording → {session_dir}")
 
     def _on_stop_session(self) -> None:
         if self.session is None:
             return
+        if self._win_active:
+            self._on_stop()
         self.session.close()
         if self._last_annotated is not None:
             cv2.imwrite(self.session.png_path, self._last_annotated)
@@ -238,7 +294,71 @@ class AppWindow(ctk.CTk):
         self.session = None
         self._stop_btn.configure(state="disabled")
         self._start_btn.configure(state="normal")
+        self._disable_window_widgets()
         self._status_var.set(f"Session saved — overlay PNG: {png_path}")
+
+    def _enable_window_widgets(self) -> None:
+        self.record_btn.configure(state="normal")
+        self.rep_entry.configure(state="normal")
+        self.force_entry.configure(state="normal")
+        self.duration_entry.configure(state="normal")
+        self.window_seg.configure(state="normal")
+
+    def _disable_window_widgets(self) -> None:
+        self.record_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.rep_entry.configure(state="disabled")
+        self.force_entry.configure(state="disabled")
+        self.duration_entry.configure(state="disabled")
+        self.window_seg.configure(state="disabled")
+        self.progress_bar.set(0.0)
+        self.timer_label.configure(text="—")
+
+    def _on_record(self) -> None:
+        rep      = int(self.rep_entry.get())
+        force_n  = float(self.force_entry.get())
+        duration = float(self.duration_entry.get())
+        win_type = self.window_seg.get()
+
+        self._win_total_frames    = int(duration * 30)
+        self._win_frames_recorded = 0
+        self._win_active          = True
+        self._win_meta            = (rep, force_n, win_type)
+
+        self.record_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.progress_bar.set(0.0)
+        self.timer_label.configure(text=f"Frames captured: 0/{self._win_total_frames}")
+
+    def _update_window_progress(self) -> None:
+        frac = self._win_frames_recorded / self._win_total_frames
+        self.progress_bar.set(frac)
+        self.timer_label.configure(
+            text=f"Frames captured: {self._win_frames_recorded}/{self._win_total_frames}"
+        )
+
+    def _complete_window(self) -> None:
+        assert self._win_meta is not None
+        rep, force_n, win_type = self._win_meta
+        self._win_active = False
+        self.session.write_window(rep, force_n, win_type)  # type: ignore[union-attr]
+        self.progress_bar.set(1.0)
+        self.timer_label.configure(text=f"Done — {self._win_total_frames}/{self._win_total_frames} frames")
+        self.record_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        if win_type == "loaded":
+            self.window_seg.set("unloaded")
+        else:
+            self.window_seg.set("loaded")
+
+    def _on_stop(self) -> None:
+        self._win_active = False
+        if self.session is not None:
+            self.session.discard_window()
+        self.progress_bar.set(0.0)
+        self.timer_label.configure(text=f"Aborted — {self._win_frames_recorded}/{self._win_total_frames} frames")
+        self.record_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
 
     def _on_ksize_slider(self, value: float) -> None:
         self.tracker.params["log_ksize"] = int(value) | 1
@@ -263,5 +383,7 @@ class AppWindow(ctk.CTk):
         if self.cap is not None:
             self.cap.release()
         if self.session is not None:
+            if self._win_active:
+                self._on_stop()
             self.session.close()
         self.destroy()
