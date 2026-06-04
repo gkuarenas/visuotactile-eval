@@ -3,6 +3,9 @@ import os
 import time
 from datetime import datetime
 
+import cv2
+import numpy as np
+
 from core.tracker import MarkerRecord
 
 
@@ -25,6 +28,7 @@ def make_session_dir() -> str:
 class CSVWriter:
     def __init__(self, session_dir: str) -> None:
         os.makedirs(session_dir, exist_ok=True)
+        self.session_dir = session_dir
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = os.path.join(session_dir, f"markers_{ts}.csv")
         self.png_path = os.path.join(session_dir, f"overlay_{ts}.png")
@@ -70,3 +74,24 @@ class CSVWriter:
 
     def close(self) -> None:
         self._f.close()
+
+
+class VideoWriter:
+    def __init__(self, session_dir: str, rep: int, win_type: str,
+                 fps: float, frame_size: tuple[int, int]) -> None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._path = os.path.join(session_dir, f"recording_rep{rep}_{win_type}_{ts}.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._writer = cv2.VideoWriter(self._path, fourcc, fps, frame_size)
+
+    def write_frame(self, frame: np.ndarray) -> None:
+        self._writer.write(frame)
+
+    def close(self) -> str:
+        self._writer.release()
+        return self._path
+
+    def discard(self) -> None:
+        self._writer.release()
+        if os.path.exists(self._path):
+            os.remove(self._path)

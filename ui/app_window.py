@@ -1,3 +1,4 @@
+import os
 import tkinter as tk
 from tkinter import filedialog
 import cv2
@@ -7,7 +8,7 @@ import customtkinter as ctk
 
 from core.tracker import Tracker
 from ui.overlay import draw_overlay
-from output.writer import CSVWriter, make_session_dir
+from output.writer import CSVWriter, VideoWriter, make_session_dir
 
 
 _FEED_W = 800
@@ -31,6 +32,7 @@ class AppWindow(ctk.CTk):
         self._win_total_frames: int = 0
         self._win_frames_recorded: int = 0
         self._win_meta: tuple[int, float, str] | None = None
+        self._video_writer: VideoWriter | None = None
 
         self._build_ui()
         self._frame_loop()
@@ -238,6 +240,8 @@ class AppWindow(ctk.CTk):
                     )
                     if self.session is not None and self._win_active:
                         self.session.buffer_frame(records, self.tracker.frame_index)
+                        if self._video_writer is not None:
+                            self._video_writer.write_frame(annotated)
                         self._win_frames_recorded += 1
                         self._update_window_progress()
                         if self._win_frames_recorded >= self._win_total_frames:
@@ -325,6 +329,12 @@ class AppWindow(ctk.CTk):
         self._win_active          = True
         self._win_meta            = (rep, force_n, win_type)
 
+        if self._last_annotated is not None:
+            h, w = self._last_annotated.shape[:2]
+            self._video_writer = VideoWriter(
+                self.session.session_dir, rep, win_type, 30.0, (w, h)  # type: ignore[union-attr]
+            )
+
         self.record_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress_bar.set(0.0)
@@ -342,6 +352,10 @@ class AppWindow(ctk.CTk):
         rep, force_n, win_type = self._win_meta
         self._win_active = False
         self.session.write_window(rep, force_n, win_type)  # type: ignore[union-attr]
+        if self._video_writer is not None:
+            vid_path = self._video_writer.close()
+            self._video_writer = None
+            self._status_var.set(f"Window saved → {os.path.basename(vid_path)}")
         self.progress_bar.set(1.0)
         self.timer_label.configure(text=f"Done — {self._win_total_frames}/{self._win_total_frames} frames")
         self.record_btn.configure(state="normal")
@@ -355,6 +369,9 @@ class AppWindow(ctk.CTk):
         self._win_active = False
         if self.session is not None:
             self.session.discard_window()
+        if self._video_writer is not None:
+            self._video_writer.discard()
+            self._video_writer = None
         self.progress_bar.set(0.0)
         self.timer_label.configure(text=f"Aborted — {self._win_frames_recorded}/{self._win_total_frames} frames")
         self.record_btn.configure(state="normal")
@@ -382,6 +399,9 @@ class AppWindow(ctk.CTk):
             self.after_cancel(self._after_id)
         if self.cap is not None:
             self.cap.release()
+        if self._video_writer is not None:
+            self._video_writer.discard()
+            self._video_writer = None
         if self.session is not None:
             if self._win_active:
                 self._on_stop()
