@@ -1,4 +1,6 @@
 import os
+import queue as _queue
+import threading as _threading
 import tkinter as tk
 from tkinter import filedialog
 import cv2
@@ -10,6 +12,7 @@ from core.tracker import Tracker
 from ui.overlay import draw_overlay
 from output.writer import CSVWriter, VideoWriter, make_session_dir
 from output.heatmap import generate as generate_heatmap
+from ender.jog_control import Ender3V2Controller, find_serial_ports
 
 
 _FEED_W = 800
@@ -35,6 +38,20 @@ class AppWindow(ctk.CTk):
         self._win_meta: tuple[int, float, str, float] | None = None
         self._video_writer: VideoWriter | None = None
         self._session_video_t0: float = 0.0
+
+        # Ender state
+        self._ender_controller: Ender3V2Controller | None = None
+        self._ender_connected: bool = False
+        self._ender_cmd_q: _queue.Queue = _queue.Queue()
+        self._ender_resp_q: _queue.Queue = _queue.Queue()
+        self._ender_x: float = 110.0
+        self._ender_y: float = 110.0
+        self._ender_z: float = 0.0
+        self._ender_zero: tuple[float, float, float] | None = None
+        self._ender_size_mm: float = 0.0
+        self._ender_homed: bool = False
+        self._ender_loop_stop: _threading.Event = _threading.Event()
+        self._ender_loop_running: bool = False
 
         self._build_ui()
         self._frame_loop()
@@ -167,6 +184,10 @@ class AppWindow(ctk.CTk):
         self._status_var = ctk.StringVar(value="Select a video source to begin")
         self._status_bar = ctk.CTkLabel(self, textvariable=self._status_var, anchor="w")
         self._status_bar.grid(row=7, column=0, sticky="ew", **pad)
+
+        # Row 8 — EnderV3 control panel
+        self._build_ender_panel()
+        self._ender_process_responses()
 
     def _add_slider(
         self,
@@ -421,6 +442,323 @@ class AppWindow(ctk.CTk):
         self.tracker.params["open"] = bool(self._open_var.get())
         self.tracker.params["dilate"] = bool(self._dilate_var.get())
 
+    # ── EnderV3 Panel ─────────────────────────────────────────────────────────
+
+    def _build_ender_panel(self) -> None:
+        pad = {"padx": 6, "pady": 4}
+        ep = ctk.CTkFrame(self)
+        ep.grid(row=8, column=0, sticky="ew", **pad)
+
+        ctk.CTkLabel(ep, text="EnderV3 Control", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=12, padx=8, pady=(4, 2), sticky="w"
+        )
+
+        # Row 1 — connection
+        ctk.CTkLabel(ep, text="Port:").grid(row=1, column=0, padx=(8, 2), sticky="e")
+        self._ender_port_var = ctk.StringVar()
+        self._ender_port_menu = ctk.CTkComboBox(ep, variable=self._ender_port_var, width=100,
+                                                state="readonly", values=[])
+        self._ender_port_menu.grid(row=1, column=1, padx=(0, 4))
+        ctk.CTkButton(ep, text="Refresh", width=70,
+                      command=self._ender_refresh_ports).grid(row=1, column=2, padx=2)
+        self._ender_connect_btn = ctk.CTkButton(ep, text="Connect", width=90,
+                                                command=self._ender_toggle_connection)
+        self._ender_connect_btn.grid(row=1, column=3, padx=2)
+        self._ender_status_lbl = ctk.CTkLabel(ep, text="Disconnected", text_color="red", anchor="w", width=220)
+        self._ender_status_lbl.grid(row=1, column=4, columnspan=4, padx=8, sticky="w")
+
+        # Row 2 — action buttons
+        ctk.CTkButton(ep, text="Home All", width=90,
+                      command=self._ender_home).grid(row=2, column=0, columnspan=2, padx=(8, 4), pady=4)
+        ctk.CTkButton(ep, text="Set as Zero", width=100,
+                      command=self._ender_set_zero).grid(row=2, column=2, columnspan=2, padx=4)
+        ctk.CTkButton(ep, text="Disable Motors", width=110,
+                      command=lambda: self._ender_queue("disable_steppers")).grid(row=2, column=4, columnspan=2, padx=4)
+        ctk.CTkButton(ep, text="ESTOP", width=80, fg_color="red", hover_color="#aa0000",
+                      command=lambda: self._ender_queue("emergency_stop")).grid(row=2, column=6, columnspan=2, padx=4)
+
+        # Row 3 — position + elastomer size
+        self._ender_pos_lbl = ctk.CTkLabel(ep, text="X: 110.00  Y: 110.00  Z: 0.00",
+                                           font=ctk.CTkFont(family="Courier"), anchor="w", width=240)
+        self._ender_pos_lbl.grid(row=3, column=0, columnspan=5, padx=8, pady=2, sticky="w")
+        ctk.CTkLabel(ep, text="Elastomer size (mm):").grid(row=3, column=5, columnspan=2, padx=(8, 2), sticky="e")
+        self._ender_size_entry = ctk.CTkEntry(ep, width=60)
+        self._ender_size_entry.insert(0, "30.0")
+        self._ender_size_entry.grid(row=3, column=7, padx=(0, 8))
+
+        # Row 4 — step sizes + jog pads
+        jog_outer = ctk.CTkFrame(ep, fg_color="transparent")
+        jog_outer.grid(row=4, column=0, columnspan=12, padx=8, pady=4, sticky="w")
+
+        # Step size inputs
+        step_sub = ctk.CTkFrame(jog_outer, fg_color="transparent")
+        step_sub.pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(step_sub, text="XY step (mm):").grid(row=0, column=0, sticky="w")
+        self._ender_xy_step_var = tk.DoubleVar(value=1.0)
+        ctk.CTkEntry(step_sub, textvariable=self._ender_xy_step_var, width=60).grid(row=0, column=1, padx=4)
+        ctk.CTkLabel(step_sub, text="Z step (mm):").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self._ender_z_step_var = tk.DoubleVar(value=1.0)
+        ctk.CTkEntry(step_sub, textvariable=self._ender_z_step_var, width=60).grid(row=1, column=1, padx=4)
+
+        # XY jog pad
+        xy_sub = ctk.CTkFrame(jog_outer, fg_color="transparent")
+        xy_sub.pack(side="left", padx=(0, 16))
+        btn_w = 48
+        ctk.CTkButton(xy_sub, text="Y+", width=btn_w,
+                      command=lambda: self._ender_jog('Y', +1)).grid(row=0, column=1, pady=2)
+        ctk.CTkButton(xy_sub, text="X-", width=btn_w,
+                      command=lambda: self._ender_jog('X', -1)).grid(row=1, column=0, padx=2)
+        ctk.CTkButton(xy_sub, text="●", width=btn_w,
+                      command=self._ender_go_center).grid(row=1, column=1)
+        ctk.CTkButton(xy_sub, text="X+", width=btn_w,
+                      command=lambda: self._ender_jog('X', +1)).grid(row=1, column=2, padx=2)
+        ctk.CTkButton(xy_sub, text="Y-", width=btn_w,
+                      command=lambda: self._ender_jog('Y', -1)).grid(row=2, column=1, pady=2)
+
+        # Z jog pad
+        z_sub = ctk.CTkFrame(jog_outer, fg_color="transparent")
+        z_sub.pack(side="left")
+        ctk.CTkButton(z_sub, text="Z+", width=btn_w,
+                      command=lambda: self._ender_jog('Z', +1)).grid(row=0, column=0, pady=2)
+        ctk.CTkButton(z_sub, text="Z-", width=btn_w,
+                      command=lambda: self._ender_jog('Z', -1)).grid(row=1, column=0, pady=2)
+
+        # Row 5 — indentation loop controls
+        loop_row = ctk.CTkFrame(ep, fg_color="transparent")
+        loop_row.grid(row=5, column=0, columnspan=12, padx=8, pady=(2, 6), sticky="w")
+
+        ctk.CTkLabel(loop_row, text="Z-disp (mm):").pack(side="left", padx=(0, 2))
+        self._ender_z_disp_entry = ctk.CTkEntry(loop_row, width=55)
+        self._ender_z_disp_entry.insert(0, "4.0")
+        self._ender_z_disp_entry.pack(side="left", padx=(0, 12))
+
+        ctk.CTkLabel(loop_row, text="Dwell (s):").pack(side="left", padx=(0, 2))
+        self._ender_dwell_entry = ctk.CTkEntry(loop_row, width=55)
+        self._ender_dwell_entry.insert(0, "2.0")
+        self._ender_dwell_entry.pack(side="left", padx=(0, 12))
+
+        ctk.CTkLabel(loop_row, text="Loops:").pack(side="left", padx=(0, 2))
+        self._ender_loops_entry = ctk.CTkEntry(loop_row, width=45)
+        self._ender_loops_entry.insert(0, "1")
+        self._ender_loops_entry.pack(side="left", padx=(0, 12))
+
+        self._ender_start_loop_btn = ctk.CTkButton(loop_row, text="Start Loop", width=90,
+                                                   command=self._ender_start_loop)
+        self._ender_start_loop_btn.pack(side="left", padx=4)
+        self._ender_stop_loop_btn = ctk.CTkButton(loop_row, text="Stop Loop", width=85,
+                                                  state="disabled", command=self._ender_stop_loop)
+        self._ender_stop_loop_btn.pack(side="left", padx=4)
+
+        self._ender_loop_status_lbl = ctk.CTkLabel(loop_row, text="—", anchor="w", width=160)
+        self._ender_loop_status_lbl.pack(side="left", padx=8)
+
+        self._ender_refresh_ports()
+
+    def _ender_refresh_ports(self) -> None:
+        ports = find_serial_ports()
+        self._ender_port_menu.configure(values=ports)
+        if ports:
+            self._ender_port_var.set(ports[0])
+
+    def _ender_toggle_connection(self) -> None:
+        if not self._ender_connected:
+            port = self._ender_port_var.get()
+            if not port:
+                self._ender_status_lbl.configure(text="No port selected", text_color="red")
+                return
+            self._ender_connect_btn.configure(text="Connecting…", state="disabled")
+            self._ender_status_lbl.configure(text="Connecting…", text_color="orange")
+            t = _threading.Thread(target=self._ender_worker_thread, args=(port,), daemon=True)
+            t.start()
+        else:
+            self._ender_cmd_q.put(("disconnect", ()))
+
+    def _ender_worker_thread(self, port: str) -> None:
+        controller = Ender3V2Controller(port, response_queue=self._ender_resp_q)
+        if not controller.connect():
+            self._ender_resp_q.put(("disconnected", None))
+            return
+        self._ender_controller = controller
+        self._ender_resp_q.put(("connected", None))
+        controller.send_command("G91")
+        controller.send_command("M204 P4000 T4000", wait_for_ok=False)
+        while True:
+            try:
+                cmd, args = self._ender_cmd_q.get(timeout=0.1)
+                if cmd == "disconnect":
+                    break
+                method = getattr(controller, cmd)
+                method(*args)
+                if cmd == "run_indentation_loop":
+                    self._ender_resp_q.put(("loop_done", None))
+            except _queue.Empty:
+                pass
+            except AttributeError as e:
+                self._ender_resp_q.put(("log", (f"Unknown command: {e}", "error")))
+        controller.disconnect()
+        self._ender_controller = None
+        self._ender_resp_q.put(("disconnected", None))
+
+    def _ender_process_responses(self) -> None:
+        try:
+            while True:
+                msg_type, data = self._ender_resp_q.get_nowait()
+                if msg_type == "connected":
+                    self._ender_connected = True
+                    self._ender_connect_btn.configure(text="Disconnect", state="normal")
+                    self._ender_status_lbl.configure(text="Connected", text_color="green")
+                elif msg_type == "disconnected":
+                    self._ender_connected = False
+                    self._ender_controller = None
+                    self._ender_connect_btn.configure(text="Connect", state="normal")
+                    self._ender_status_lbl.configure(text="Disconnected", text_color="red")
+                    if self._ender_loop_running:
+                        self._ender_loop_running = False
+                        self._ender_start_loop_btn.configure(state="normal")
+                        self._ender_stop_loop_btn.configure(state="disabled")
+                        self._ender_loop_status_lbl.configure(text="—")
+                elif msg_type == "log":
+                    msg, _ = data
+                    self._ender_status_lbl.configure(text=msg[:60])
+                elif msg_type == "loop_done":
+                    self._ender_loop_running = False
+                    self._ender_start_loop_btn.configure(state="normal")
+                    self._ender_stop_loop_btn.configure(state="disabled")
+                    self._ender_loop_status_lbl.configure(text="Loop complete")
+        except _queue.Empty:
+            pass
+        self.after(100, self._ender_process_responses)
+
+    def _ender_queue(self, cmd: str, *args) -> None:
+        if self._ender_connected:
+            self._ender_cmd_q.put((cmd, args))
+        else:
+            self._ender_status_lbl.configure(text="Not connected", text_color="red")
+
+    def _ender_jog(self, axis: str, direction: int) -> None:
+        if not self._ender_connected:
+            self._ender_status_lbl.configure(text="Not connected", text_color="red")
+            return
+
+        step = self._ender_xy_step_var.get() if axis in ('X', 'Y') else self._ender_z_step_var.get()
+        distance = direction * step
+
+        if axis == 'X':
+            new_pos = self._ender_x + distance
+            if self._ender_zero is not None and self._ender_size_mm > 0:
+                half = self._ender_size_mm / 2
+                if abs(new_pos - self._ender_zero[0]) > half:
+                    self._ender_status_lbl.configure(text="X exceeds elastomer bounds", text_color="orange")
+                    return
+            elif not (0 <= new_pos <= 220):
+                self._ender_status_lbl.configure(text="X out of machine bounds", text_color="orange")
+                return
+            self._ender_x = new_pos
+        elif axis == 'Y':
+            new_pos = self._ender_y + distance
+            if self._ender_zero is not None and self._ender_size_mm > 0:
+                half = self._ender_size_mm / 2
+                if abs(new_pos - self._ender_zero[1]) > half:
+                    self._ender_status_lbl.configure(text="Y exceeds elastomer bounds", text_color="orange")
+                    return
+            elif not (0 <= new_pos <= 220):
+                self._ender_status_lbl.configure(text="Y out of machine bounds", text_color="orange")
+                return
+            self._ender_y = new_pos
+        elif axis == 'Z':
+            new_pos = self._ender_z + distance
+            if not (0 <= new_pos <= 250):
+                self._ender_status_lbl.configure(text="Z out of machine bounds", text_color="orange")
+                return
+            self._ender_z = new_pos
+
+        self._ender_update_pos()
+        self._ender_cmd_q.put(("move_axis", (axis, distance)))
+
+    def _ender_set_zero(self) -> None:
+        self._ender_zero = (self._ender_x, self._ender_y, self._ender_z)
+        try:
+            self._ender_size_mm = float(self._ender_size_entry.get())
+        except ValueError:
+            self._ender_size_mm = 0.0
+        self._ender_status_lbl.configure(
+            text=f"Zero: X={self._ender_x:.2f} Y={self._ender_y:.2f} Z={self._ender_z:.2f}",
+            text_color="green",
+        )
+
+    def _ender_go_center(self) -> None:
+        if not self._ender_connected:
+            self._ender_status_lbl.configure(text="Not connected", text_color="red")
+            return
+        if not self._ender_homed:
+            self._ender_status_lbl.configure(text="Home first", text_color="orange")
+            return
+        if self._ender_zero is not None:
+            cx, cy = self._ender_zero[0], self._ender_zero[1]
+        else:
+            cx, cy = 110.0, 110.0
+        self._ender_cmd_q.put(("send_command", ("G90",)))
+        self._ender_cmd_q.put(("send_command", (f"G1 X{cx:.2f} Y{cy:.2f} F3000",)))
+        self._ender_cmd_q.put(("send_command", ("G91",)))
+        self._ender_x = cx
+        self._ender_y = cy
+        self._ender_update_pos()
+
+    def _ender_home(self) -> None:
+        if not self._ender_connected:
+            self._ender_status_lbl.configure(text="Not connected", text_color="red")
+            return
+        self._ender_cmd_q.put(("home_all_axes", ()))
+        self._ender_status_lbl.configure(text="Homing… (~35 s)", text_color="orange")
+
+        def _after_home() -> None:
+            import time as _time
+            _time.sleep(35)
+            self._ender_x = 110.0
+            self._ender_y = 110.0
+            self._ender_z = 0.0
+            self._ender_homed = True
+            self._ender_cmd_q.put(("send_command", ("G90",)))
+            self._ender_cmd_q.put(("send_command", ("G1 X110.00 Y110.00 F3000",)))
+            self._ender_cmd_q.put(("send_command", ("G91",)))
+            self.after(0, self._ender_update_pos)
+            self.after(0, lambda: self._ender_status_lbl.configure(text="Homed — at centre", text_color="green"))
+
+        _threading.Thread(target=_after_home, daemon=True).start()
+
+    def _ender_update_pos(self) -> None:
+        self._ender_pos_lbl.configure(
+            text=f"X: {self._ender_x:7.2f}  Y: {self._ender_y:7.2f}  Z: {self._ender_z:7.2f}"
+        )
+
+    def _ender_start_loop(self) -> None:
+        if not self._ender_connected:
+            self._ender_status_lbl.configure(text="Not connected", text_color="red")
+            return
+        try:
+            z_disp = float(self._ender_z_disp_entry.get())
+            dwell  = float(self._ender_dwell_entry.get())
+            n_loops = int(self._ender_loops_entry.get())
+        except ValueError:
+            self._ender_loop_status_lbl.configure(text="Invalid input")
+            return
+        if z_disp <= 0 or dwell < 0 or n_loops < 1:
+            self._ender_loop_status_lbl.configure(text="Check values")
+            return
+
+        self._ender_loop_stop.clear()
+        self._ender_loop_running = True
+        self._ender_start_loop_btn.configure(state="disabled")
+        self._ender_stop_loop_btn.configure(state="normal")
+        self._ender_loop_status_lbl.configure(text=f"Running… (×{n_loops})")
+        self._ender_cmd_q.put(("run_indentation_loop", (z_disp, dwell, n_loops, self._ender_loop_stop)))
+
+    def _ender_stop_loop(self) -> None:
+        self._ender_loop_stop.set()
+        self._ender_loop_status_lbl.configure(text="Stopping…")
+
+    # ── Window close ──────────────────────────────────────────────────────────
+
     def on_closing(self) -> None:
         if self._after_id is not None:
             self.after_cancel(self._after_id)
@@ -433,4 +771,6 @@ class AppWindow(ctk.CTk):
             if self._win_active:
                 self._on_stop()
             self.session.close()
+        if self._ender_connected:
+            self._ender_cmd_q.put(("disconnect", ()))
         self.destroy()
