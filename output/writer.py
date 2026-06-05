@@ -1,6 +1,5 @@
 import csv
 import os
-import time
 from datetime import datetime
 
 import cv2
@@ -35,12 +34,10 @@ class CSVWriter:
         self._f = open(self.csv_path, "w", newline="")
         self._w = csv.DictWriter(self._f, fieldnames=COLUMNS)
         self._w.writeheader()
-        self._t0 = time.perf_counter()
         self._pending: list[tuple[list[MarkerRecord], int, float]] = []
 
-    def buffer_frame(self, records: list[MarkerRecord], frame_idx: int) -> None:
-        ms = (time.perf_counter() - self._t0) * 1000
-        self._pending.append((records, frame_idx, ms))
+    def buffer_frame(self, records: list[MarkerRecord], frame_idx: int, timestamp_ms: float) -> None:
+        self._pending.append((records, frame_idx, timestamp_ms))
 
     def write_window(self, rep: int, force_n: float, window_type: str) -> None:
         for records, frame_idx, ms in self._pending:

@@ -33,6 +33,7 @@ class AppWindow(ctk.CTk):
         self._win_frames_recorded: int = 0
         self._win_meta: tuple[int, float, str] | None = None
         self._video_writer: VideoWriter | None = None
+        self._session_video_t0: float = 0.0
 
         self._build_ui()
         self._frame_loop()
@@ -223,6 +224,7 @@ class AppWindow(ctk.CTk):
 
     def _frame_loop(self) -> None:
         if self.cap is not None and self.cap.isOpened():
+            pos_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
             ret, frame = self.cap.read()
             if not ret:
                 if self._src_var.get() == "Video File":
@@ -239,7 +241,7 @@ class AppWindow(ctk.CTk):
                         self.tracker.frame_index,
                     )
                     if self.session is not None and self._win_active:
-                        self.session.buffer_frame(records, self.tracker.frame_index)
+                        self.session.buffer_frame(records, self.tracker.frame_index, pos_ms - self._session_video_t0)
                         if self._video_writer is not None:
                             self._video_writer.write_frame(annotated)
                         self._win_frames_recorded += 1
@@ -281,6 +283,7 @@ class AppWindow(ctk.CTk):
         session_dir = make_session_dir()
         self.session = CSVWriter(session_dir)
         self.tracker.frame_index = 0
+        self._session_video_t0 = self.cap.get(cv2.CAP_PROP_POS_MSEC) if self.cap else 0.0
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._enable_window_widgets()
