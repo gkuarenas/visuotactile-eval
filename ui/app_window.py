@@ -15,15 +15,20 @@ from output.heatmap import generate as generate_heatmap
 from ender.jog_control import Ender3V2Controller, find_serial_ports
 
 
-_FEED_W = 800
-_FEED_H = 600
+_FEED_ASPECT = 4 / 3   # camera native ratio (width / height)
+_RIGHT_W     = 420     # right panel minimum width px
 
 
 class AppWindow(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("mdm-kalman — Marker Displacement Tracker")
-        self.resizable(False, False)
+        self.geometry("1280x800")
+        self.minsize(900, 600)
+        self.resizable(True, True)
+        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=0)
+        self.columnconfigure(0, weight=1)
 
         self.tracker = Tracker("calibration.json")
         self.cap: cv2.VideoCapture | None = None
@@ -38,6 +43,10 @@ class AppWindow(ctk.CTk):
         self._win_meta: tuple[int, float, str, float] | None = None
         self._video_writer: VideoWriter | None = None
         self._session_video_t0: float = 0.0
+
+        self._feed_display_w: int = 800
+        self._feed_display_h: int = 600
+        self._params_visible: bool = True
 
         # Ender state
         self._ender_controller: Ender3V2Controller | None = None
@@ -58,12 +67,28 @@ class AppWindow(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def _build_ui(self) -> None:
-        pad = {"padx": 6, "pady": 4}
+    # ── Layout ────────────────────────────────────────────────────────────────
 
-        # Row 0 — source controls
-        src_frame = ctk.CTkFrame(self)
-        src_frame.grid(row=0, column=0, sticky="ew", **pad)
+    def _build_ui(self) -> None:
+        # ── Top frame: feed (left, expands) + controls (right, fixed) ────────
+        top = ctk.CTkFrame(self)
+        top.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, minsize=_RIGHT_W, weight=0)
+        top.rowconfigure(0, weight=1)
+
+        # Feed label fills left column, scales to 4:3
+        self._feed_label = ctk.CTkLabel(top, text="No source")
+        self._feed_label.grid(row=0, column=0, sticky="nsew", padx=(4, 2), pady=4)
+        self._feed_label.bind("<Configure>", self._on_feed_resize)
+
+        # Right panel — pack-based vertical stack
+        rp = ctk.CTkFrame(top)
+        rp.grid(row=0, column=1, sticky="ns", padx=(2, 4), pady=4)
+
+        # Source controls
+        src_frame = ctk.CTkFrame(rp)
+        src_frame.pack(side="top", fill="x", padx=6, pady=(6, 3))
 
         self._src_var = ctk.StringVar(value="Video File")
         ctk.CTkOptionMenu(
@@ -72,120 +97,130 @@ class AppWindow(ctk.CTk):
             values=["Video File", "Live Camera"],
             command=self._on_source_change,
             width=130,
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=4, pady=4)
 
-        ctk.CTkLabel(src_frame, text="Cam idx:").pack(side="left", padx=(8, 2))
-        self._cam_entry = ctk.CTkEntry(src_frame, width=40)
+        ctk.CTkLabel(src_frame, text="Cam:").pack(side="left", padx=(4, 2))
+        self._cam_entry = ctk.CTkEntry(src_frame, width=36)
         self._cam_entry.insert(0, "0")
         self._cam_entry.pack(side="left")
 
         self._browse_btn = ctk.CTkButton(
-            src_frame, text="Browse...", width=90, command=self._on_browse
+            src_frame, text="Browse...", width=80, command=self._on_browse
         )
-        self._browse_btn.pack(side="left", padx=8)
+        self._browse_btn.pack(side="left", padx=6)
 
         self._connect_btn = ctk.CTkButton(
-            src_frame, text="Connect", width=80, command=self._start_video_source
+            src_frame, text="Connect", width=72, command=self._start_video_source
         )
-        self._connect_btn.pack(side="left", padx=4)
+        self._connect_btn.pack(side="left", padx=(0, 4))
 
-        # Row 1 — live feed
-        self._feed_label = ctk.CTkLabel(self, text="No source", width=_FEED_W, height=_FEED_H)
-        self._feed_label.grid(row=1, column=0, **pad)
+        # Detection params toggle button
+        self._params_btn = ctk.CTkButton(
+            rp,
+            text="Detection Params ▼",
+            anchor="w",
+            height=28,
+            fg_color="transparent",
+            text_color=("gray20", "gray80"),
+            hover_color=("gray85", "gray30"),
+            command=self._toggle_params,
+        )
+        self._params_btn.pack(side="top", fill="x", padx=6, pady=(4, 0))
 
-        # Row 2 — LoG sliders
-        slider_frame = ctk.CTkFrame(self)
-        slider_frame.grid(row=2, column=0, sticky="ew", **pad)
-        self._add_slider(slider_frame, "LoG ksize", 3, 101, 61, self._on_ksize_slider, col=0)
-        self._add_slider(slider_frame, "LoG sigma", 1.0, 30.0, 20.0, self._on_sigma_slider, col=3, fmt="{:.1f}")
+        # Collapsible detection params inner frame
+        self._detection_inner = ctk.CTkFrame(rp)
+        self._detection_inner.pack(side="top", fill="x", padx=6, pady=(0, 2))
 
-        # Row 3 — gate / threshold sliders
-        slider_frame2 = ctk.CTkFrame(self)
-        slider_frame2.grid(row=3, column=0, sticky="ew", **pad)
-        self._add_slider(slider_frame2, "Gate px", 20, 400, 200, self._on_gate_slider, col=0)
-        self._add_slider(slider_frame2, "Threshold", 1, 255, 75, self._on_thresh_slider, col=3)
+        self._add_slider(self._detection_inner, "LoG ksize", 3, 101, 61,
+                         self._on_ksize_slider, col=0, row=0, slider_width=140)
+        self._add_slider(self._detection_inner, "LoG sigma", 1.0, 30.0, 20.0,
+                         self._on_sigma_slider, col=0, row=1, fmt="{:.1f}", slider_width=140)
+        self._add_slider(self._detection_inner, "Gate px", 20, 400, 200,
+                         self._on_gate_slider, col=0, row=2, slider_width=140)
+        self._add_slider(self._detection_inner, "Threshold", 1, 255, 75,
+                         self._on_thresh_slider, col=0, row=3, slider_width=140)
 
-        # Row 4 — morphology checkboxes
-        morph_frame = ctk.CTkFrame(self)
-        morph_frame.grid(row=4, column=0, sticky="ew", **pad)
+        morph_row = ctk.CTkFrame(self._detection_inner, fg_color="transparent")
+        morph_row.grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 4))
         self._erode_var = ctk.BooleanVar(value=True)
-        self._open_var = ctk.BooleanVar(value=True)
+        self._open_var  = ctk.BooleanVar(value=True)
         self._dilate_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(morph_frame, text="Erode", variable=self._erode_var,
-                        command=self._on_morph_change).pack(side="left", padx=8)
-        ctk.CTkCheckBox(morph_frame, text="Open", variable=self._open_var,
-                        command=self._on_morph_change).pack(side="left", padx=8)
-        ctk.CTkCheckBox(morph_frame, text="Dilate", variable=self._dilate_var,
-                        command=self._on_morph_change).pack(side="left", padx=8)
+        ctk.CTkCheckBox(morph_row, text="Erode",  variable=self._erode_var,
+                        command=self._on_morph_change).pack(side="left", padx=6)
+        ctk.CTkCheckBox(morph_row, text="Open",   variable=self._open_var,
+                        command=self._on_morph_change).pack(side="left", padx=6)
+        ctk.CTkCheckBox(morph_row, text="Dilate", variable=self._dilate_var,
+                        command=self._on_morph_change).pack(side="left", padx=6)
 
-        # Row 5 — window recording panel
-        win_frame = ctk.CTkFrame(self)
-        win_frame.grid(row=5, column=0, sticky="ew", **pad)
+        # Window Recording panel (2×2 entry grid)
+        self._win_frame = ctk.CTkFrame(rp)
+        self._win_frame.pack(side="top", fill="x", padx=6, pady=3)
 
-        ctk.CTkLabel(win_frame, text="Window Recording", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=10, padx=8, pady=(4, 2), sticky="w"
+        ctk.CTkLabel(self._win_frame, text="Window Recording",
+                     font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w"
         )
 
-        ctk.CTkLabel(win_frame, text="Rep:").grid(row=1, column=0, padx=(8, 2), sticky="e")
-        self.rep_entry = ctk.CTkEntry(win_frame, width=48, state="disabled")
-        self.rep_entry.grid(row=1, column=1, padx=(0, 8))
+        ctk.CTkLabel(self._win_frame, text="Rep:").grid(row=1, column=0, padx=(8, 2), sticky="e")
+        self.rep_entry = ctk.CTkEntry(self._win_frame, width=48, state="disabled")
+        self.rep_entry.grid(row=1, column=1, padx=(0, 6), pady=2, sticky="w")
         self.rep_entry.insert(0, "1")
 
-        ctk.CTkLabel(win_frame, text="Force (N):").grid(row=1, column=2, padx=(8, 2), sticky="e")
-        self.force_entry = ctk.CTkEntry(win_frame, width=60, state="disabled")
-        self.force_entry.grid(row=1, column=3, padx=(0, 8))
+        ctk.CTkLabel(self._win_frame, text="Force (N):").grid(row=1, column=2, padx=(6, 2), sticky="e")
+        self.force_entry = ctk.CTkEntry(self._win_frame, width=60, state="disabled")
+        self.force_entry.grid(row=1, column=3, padx=(0, 8), pady=2, sticky="w")
         self.force_entry.insert(0, "0.0")
 
-        ctk.CTkLabel(win_frame, text="Duration (s):").grid(row=1, column=4, padx=(8, 2), sticky="e")
-        self.duration_entry = ctk.CTkEntry(win_frame, width=60, state="disabled")
-        self.duration_entry.grid(row=1, column=5, padx=(0, 8))
+        ctk.CTkLabel(self._win_frame, text="Duration (s):").grid(row=2, column=0, padx=(8, 2), sticky="e")
+        self.duration_entry = ctk.CTkEntry(self._win_frame, width=48, state="disabled")
+        self.duration_entry.grid(row=2, column=1, padx=(0, 6), pady=2, sticky="w")
         self.duration_entry.insert(0, "5.0")
 
-        ctk.CTkLabel(win_frame, text="Indenter Z (mm):").grid(row=1, column=6, padx=(8, 2), sticky="e")
-        self.indenter_z_entry = ctk.CTkEntry(win_frame, width=60, state="disabled")
-        self.indenter_z_entry.grid(row=1, column=7, padx=(0, 8))
+        ctk.CTkLabel(self._win_frame, text="Indenter Z:").grid(row=2, column=2, padx=(6, 2), sticky="e")
+        self.indenter_z_entry = ctk.CTkEntry(self._win_frame, width=60, state="disabled")
+        self.indenter_z_entry.grid(row=2, column=3, padx=(0, 8), pady=2, sticky="w")
         self.indenter_z_entry.insert(0, "0.0")
 
         self.window_seg = ctk.CTkSegmentedButton(
-            win_frame, values=["loaded", "unloaded"], state="disabled"
+            self._win_frame, values=["loaded", "unloaded"], state="disabled"
         )
         self.window_seg.set("loaded")
-        self.window_seg.grid(row=1, column=8, padx=8)
+        self.window_seg.grid(row=3, column=0, columnspan=2, padx=8, pady=4, sticky="w")
 
-        btn_sub = ctk.CTkFrame(win_frame, fg_color="transparent")
-        btn_sub.grid(row=1, column=9, padx=8)
-        self.record_btn = ctk.CTkButton(btn_sub, text="Record", width=80,
+        rec_sub = ctk.CTkFrame(self._win_frame, fg_color="transparent")
+        rec_sub.grid(row=3, column=2, columnspan=2, padx=(0, 8), pady=4, sticky="e")
+        self.record_btn = ctk.CTkButton(rec_sub, text="Record", width=76,
                                         state="disabled", command=self._on_record)
-        self.record_btn.pack(side="left", padx=4)
-        self.stop_btn = ctk.CTkButton(btn_sub, text="Stop", width=70,
+        self.record_btn.pack(side="left", padx=2)
+        self.stop_btn = ctk.CTkButton(rec_sub, text="Stop", width=66,
                                       state="disabled", command=self._on_stop)
-        self.stop_btn.pack(side="left", padx=4)
+        self.stop_btn.pack(side="left", padx=2)
 
-        self.progress_bar = ctk.CTkProgressBar(win_frame, width=200)
+        self.progress_bar = ctk.CTkProgressBar(self._win_frame)
         self.progress_bar.set(0.0)
-        self.progress_bar.grid(row=2, column=0, columnspan=6, padx=8, pady=(4, 4), sticky="w")
+        self.progress_bar.grid(row=4, column=0, columnspan=4, padx=8, pady=(2, 0), sticky="ew")
 
-        self.timer_label = ctk.CTkLabel(win_frame, text="Frames captured: —", width=180, anchor="w")
-        self.timer_label.grid(row=2, column=6, columnspan=2, padx=8, sticky="w")
+        self.timer_label = ctk.CTkLabel(self._win_frame, text="Frames captured: —", anchor="w")
+        self.timer_label.grid(row=5, column=0, columnspan=4, padx=8, pady=(2, 4), sticky="w")
 
-        # Row 6 — action buttons
-        btn_frame = ctk.CTkFrame(self)
-        btn_frame.grid(row=6, column=0, **pad)
-        ctk.CTkButton(btn_frame, text="Capture Baseline", command=self._on_capture_baseline
-                      ).pack(side="left", padx=6)
+        # Session action buttons
+        btn_frame = ctk.CTkFrame(rp)
+        btn_frame.pack(side="top", fill="x", padx=6, pady=3)
+        ctk.CTkButton(btn_frame, text="Capture Baseline",
+                      command=self._on_capture_baseline).pack(side="left", padx=6, pady=4)
         self._start_btn = ctk.CTkButton(btn_frame, text="Start Session",
                                         command=self._on_start_session, state="disabled")
-        self._start_btn.pack(side="left", padx=6)
+        self._start_btn.pack(side="left", padx=4)
         self._stop_btn = ctk.CTkButton(btn_frame, text="Stop Session",
                                        command=self._on_stop_session, state="disabled")
-        self._stop_btn.pack(side="left", padx=6)
+        self._stop_btn.pack(side="left", padx=4)
 
-        # Row 7 — status bar
+        # Status bar (bottom of right panel)
         self._status_var = ctk.StringVar(value="Select a video source to begin")
-        self._status_bar = ctk.CTkLabel(self, textvariable=self._status_var, anchor="w")
-        self._status_bar.grid(row=7, column=0, sticky="ew", **pad)
+        self._status_bar = ctk.CTkLabel(rp, textvariable=self._status_var, anchor="w")
+        self._status_bar.pack(side="top", fill="x", padx=8, pady=(2, 6))
 
-        # Row 8 — EnderV3 control panel
+        # EnderV3 panel (full-width below top frame)
         self._build_ender_panel()
         self._ender_process_responses()
 
@@ -198,17 +233,52 @@ class AppWindow(ctk.CTk):
         default: float,
         command,
         col: int,
+        row: int = 0,
         fmt: str = "{:.0f}",
+        slider_width: int = 180,
     ) -> ctk.CTkSlider:
-        range_label = f"{label} ({from_:.0f}–{to:.0f}):" if fmt == "{:.0f}" else f"{label} ({from_:.1f}–{to:.1f}):"
-        ctk.CTkLabel(parent, text=range_label).grid(row=0, column=col, padx=(8, 2), sticky="e")
+        range_label = (
+            f"{label} ({from_:.0f}–{to:.0f}):"
+            if fmt == "{:.0f}"
+            else f"{label} ({from_:.1f}–{to:.1f}):"
+        )
+        ctk.CTkLabel(parent, text=range_label).grid(row=row, column=col, padx=(8, 2), sticky="e")
         val_var = ctk.StringVar(value=fmt.format(default))
-        slider = ctk.CTkSlider(parent, from_=from_, to=to, width=180,
-                               command=lambda v, vv=val_var, cb=command, f=fmt: (vv.set(f.format(v)), cb(v)))
+        slider = ctk.CTkSlider(
+            parent, from_=from_, to=to, width=slider_width,
+            command=lambda v, vv=val_var, cb=command, f=fmt: (vv.set(f.format(v)), cb(v))
+        )
         slider.set(default)
-        slider.grid(row=0, column=col + 1, padx=(0, 4))
-        ctk.CTkLabel(parent, textvariable=val_var, width=44, anchor="w").grid(row=0, column=col + 2, padx=(0, 8))
+        slider.grid(row=row, column=col + 1, padx=(0, 4))
+        ctk.CTkLabel(parent, textvariable=val_var, width=44, anchor="w").grid(
+            row=row, column=col + 2, padx=(0, 8)
+        )
         return slider
+
+    # ── Feed scaling ──────────────────────────────────────────────────────────
+
+    def _on_feed_resize(self, event: tk.Event) -> None:
+        aw, ah = max(event.width, 1), max(event.height, 1)
+        if aw * 3 < ah * 4:
+            w, h = aw, aw * 3 // 4
+        else:
+            h, w = ah, ah * 4 // 3
+        self._feed_display_w = max(w, 1)
+        self._feed_display_h = max(h, 1)
+
+    def _toggle_params(self) -> None:
+        if self._params_visible:
+            self._detection_inner.pack_forget()
+            self._params_btn.configure(text="Detection Params ▶")
+        else:
+            self._detection_inner.pack(
+                side="top", fill="x", padx=6, pady=(0, 2),
+                before=self._win_frame,
+            )
+            self._params_btn.configure(text="Detection Params ▼")
+        self._params_visible = not self._params_visible
+
+    # ── Source & video ────────────────────────────────────────────────────────
 
     def _on_source_change(self, value: str) -> None:
         if value == "Live Camera":
@@ -268,7 +338,10 @@ class AppWindow(ctk.CTk):
                         self.tracker.frame_index,
                     )
                     if self.session is not None and self._win_active:
-                        self.session.buffer_frame(records, self.tracker.frame_index, pos_ms - self._session_video_t0)
+                        self.session.buffer_frame(
+                            records, self.tracker.frame_index,
+                            pos_ms - self._session_video_t0,
+                        )
                         if self._video_writer is not None:
                             self._video_writer.write_frame(annotated)
                         self._win_frames_recorded += 1
@@ -284,12 +357,14 @@ class AppWindow(ctk.CTk):
         self._after_id = self.after(33, self._frame_loop)
 
     def _update_feed(self, frame: np.ndarray) -> None:
+        w, h = self._feed_display_w, self._feed_display_h
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        img = img.resize((_FEED_W, _FEED_H), Image.BILINEAR)
+        img = Image.fromarray(rgb).resize((w, h), Image.BILINEAR)
         photo = ImageTk.PhotoImage(img)
         self._feed_label.configure(image=photo, text="")
         self._feed_label.image = photo  # prevent GC
+
+    # ── Baseline & sessions ───────────────────────────────────────────────────
 
     def _on_capture_baseline(self) -> None:
         if self.cap is None or not self.cap.isOpened():
@@ -302,7 +377,7 @@ class AppWindow(ctk.CTk):
         n = self.tracker.capture_baseline(frame)
         msg = f"{n} markers initialized"
         if n < 100:
-            msg += f"  [WARNING: expected ~154]"
+            msg += "  [WARNING: expected ~154]"
         self._status_var.set(msg)
         self._start_btn.configure(state="normal")
         if self.tracker._last_baseline_binary is not None:
@@ -346,6 +421,8 @@ class AppWindow(ctk.CTk):
             status += f"  |  heatmap: {os.path.basename(heatmap_path)}"
         self._status_var.set(status)
 
+    # ── Window recording ──────────────────────────────────────────────────────
+
     def _enable_window_widgets(self) -> None:
         self.record_btn.configure(state="normal")
         self.rep_entry.configure(state="normal")
@@ -366,11 +443,11 @@ class AppWindow(ctk.CTk):
         self.timer_label.configure(text="—")
 
     def _on_record(self) -> None:
-        rep          = int(self.rep_entry.get())
-        force_n      = float(self.force_entry.get())
-        duration     = float(self.duration_entry.get())
-        win_type     = self.window_seg.get()
-        indenter_z   = float(self.indenter_z_entry.get())
+        rep        = int(self.rep_entry.get())
+        force_n    = float(self.force_entry.get())
+        duration   = float(self.duration_entry.get())
+        win_type   = self.window_seg.get()
+        indenter_z = float(self.indenter_z_entry.get())
 
         self._win_total_frames    = int(duration * 30)
         self._win_frames_recorded = 0
@@ -421,9 +498,13 @@ class AppWindow(ctk.CTk):
             self._video_writer.discard()
             self._video_writer = None
         self.progress_bar.set(0.0)
-        self.timer_label.configure(text=f"Aborted — {self._win_frames_recorded}/{self._win_total_frames} frames")
+        self.timer_label.configure(
+            text=f"Aborted — {self._win_frames_recorded}/{self._win_total_frames} frames"
+        )
         self.record_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+
+    # ── Tracker param callbacks ───────────────────────────────────────────────
 
     def _on_ksize_slider(self, value: float) -> None:
         self.tracker.params["log_ksize"] = int(value) | 1
@@ -438,16 +519,15 @@ class AppWindow(ctk.CTk):
         self.tracker.params["thresh"] = int(value)
 
     def _on_morph_change(self) -> None:
-        self.tracker.params["erode"] = bool(self._erode_var.get())
-        self.tracker.params["open"] = bool(self._open_var.get())
+        self.tracker.params["erode"]  = bool(self._erode_var.get())
+        self.tracker.params["open"]   = bool(self._open_var.get())
         self.tracker.params["dilate"] = bool(self._dilate_var.get())
 
     # ── EnderV3 Panel ─────────────────────────────────────────────────────────
 
     def _build_ender_panel(self) -> None:
-        pad = {"padx": 6, "pady": 4}
         ep = ctk.CTkFrame(self)
-        ep.grid(row=8, column=0, sticky="ew", **pad)
+        ep.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 4))
 
         ctk.CTkLabel(ep, text="EnderV3 Control", font=ctk.CTkFont(weight="bold")).grid(
             row=0, column=0, columnspan=12, padx=8, pady=(4, 2), sticky="w"
@@ -464,7 +544,8 @@ class AppWindow(ctk.CTk):
         self._ender_connect_btn = ctk.CTkButton(ep, text="Connect", width=90,
                                                 command=self._ender_toggle_connection)
         self._ender_connect_btn.grid(row=1, column=3, padx=2)
-        self._ender_status_lbl = ctk.CTkLabel(ep, text="Disconnected", text_color="red", anchor="w", width=220)
+        self._ender_status_lbl = ctk.CTkLabel(ep, text="Disconnected", text_color="red",
+                                              anchor="w", width=220)
         self._ender_status_lbl.grid(row=1, column=4, columnspan=4, padx=8, sticky="w")
 
         # Row 2 — action buttons
@@ -478,10 +559,13 @@ class AppWindow(ctk.CTk):
                       command=lambda: self._ender_queue("emergency_stop")).grid(row=2, column=6, columnspan=2, padx=4)
 
         # Row 3 — position + elastomer size
-        self._ender_pos_lbl = ctk.CTkLabel(ep, text="X: 110.00  Y: 110.00  Z: 0.00",
-                                           font=ctk.CTkFont(family="Courier"), anchor="w", width=240)
+        self._ender_pos_lbl = ctk.CTkLabel(
+            ep, text="X: 110.00  Y: 110.00  Z:   0.00",
+            font=ctk.CTkFont(family="Courier"), anchor="w", width=260,
+        )
         self._ender_pos_lbl.grid(row=3, column=0, columnspan=5, padx=8, pady=2, sticky="w")
-        ctk.CTkLabel(ep, text="Elastomer size (mm):").grid(row=3, column=5, columnspan=2, padx=(8, 2), sticky="e")
+        ctk.CTkLabel(ep, text="Elastomer size (mm):").grid(row=3, column=5, columnspan=2,
+                                                           padx=(8, 2), sticky="e")
         self._ender_size_entry = ctk.CTkEntry(ep, width=60)
         self._ender_size_entry.insert(0, "30.0")
         self._ender_size_entry.grid(row=3, column=7, padx=(0, 8))
@@ -490,7 +574,6 @@ class AppWindow(ctk.CTk):
         jog_outer = ctk.CTkFrame(ep, fg_color="transparent")
         jog_outer.grid(row=4, column=0, columnspan=12, padx=8, pady=4, sticky="w")
 
-        # Step size inputs
         step_sub = ctk.CTkFrame(jog_outer, fg_color="transparent")
         step_sub.pack(side="left", padx=(0, 16))
         ctk.CTkLabel(step_sub, text="XY step (mm):").grid(row=0, column=0, sticky="w")
@@ -500,7 +583,6 @@ class AppWindow(ctk.CTk):
         self._ender_z_step_var = tk.DoubleVar(value=1.0)
         ctk.CTkEntry(step_sub, textvariable=self._ender_z_step_var, width=60).grid(row=1, column=1, padx=4)
 
-        # XY jog pad
         xy_sub = ctk.CTkFrame(jog_outer, fg_color="transparent")
         xy_sub.pack(side="left", padx=(0, 16))
         btn_w = 48
@@ -515,7 +597,6 @@ class AppWindow(ctk.CTk):
         ctk.CTkButton(xy_sub, text="Y-", width=btn_w,
                       command=lambda: self._ender_jog('Y', -1)).grid(row=2, column=1, pady=2)
 
-        # Z jog pad
         z_sub = ctk.CTkFrame(jog_outer, fg_color="transparent")
         z_sub.pack(side="left")
         ctk.CTkButton(z_sub, text="Z+", width=btn_w,
@@ -646,8 +727,7 @@ class AppWindow(ctk.CTk):
         if axis == 'X':
             new_pos = self._ender_x + distance
             if self._ender_zero is not None and self._ender_size_mm > 0:
-                half = self._ender_size_mm / 2
-                if abs(new_pos - self._ender_zero[0]) > half:
+                if abs(new_pos - self._ender_zero[0]) > self._ender_size_mm / 2:
                     self._ender_status_lbl.configure(text="X exceeds elastomer bounds", text_color="orange")
                     return
             elif not (0 <= new_pos <= 220):
@@ -657,8 +737,7 @@ class AppWindow(ctk.CTk):
         elif axis == 'Y':
             new_pos = self._ender_y + distance
             if self._ender_zero is not None and self._ender_size_mm > 0:
-                half = self._ender_size_mm / 2
-                if abs(new_pos - self._ender_zero[1]) > half:
+                if abs(new_pos - self._ender_zero[1]) > self._ender_size_mm / 2:
                     self._ender_status_lbl.configure(text="Y exceeds elastomer bounds", text_color="orange")
                     return
             elif not (0 <= new_pos <= 220):
@@ -693,15 +772,11 @@ class AppWindow(ctk.CTk):
         if not self._ender_homed:
             self._ender_status_lbl.configure(text="Home first", text_color="orange")
             return
-        if self._ender_zero is not None:
-            cx, cy = self._ender_zero[0], self._ender_zero[1]
-        else:
-            cx, cy = 110.0, 110.0
+        cx, cy = (self._ender_zero[0], self._ender_zero[1]) if self._ender_zero else (110.0, 110.0)
         self._ender_cmd_q.put(("send_command", ("G90",)))
         self._ender_cmd_q.put(("send_command", (f"G1 X{cx:.2f} Y{cy:.2f} F3000",)))
         self._ender_cmd_q.put(("send_command", ("G91",)))
-        self._ender_x = cx
-        self._ender_y = cy
+        self._ender_x, self._ender_y = cx, cy
         self._ender_update_pos()
 
     def _ender_home(self) -> None:
@@ -714,15 +789,14 @@ class AppWindow(ctk.CTk):
         def _after_home() -> None:
             import time as _time
             _time.sleep(35)
-            self._ender_x = 110.0
-            self._ender_y = 110.0
-            self._ender_z = 0.0
+            self._ender_x, self._ender_y, self._ender_z = 110.0, 110.0, 0.0
             self._ender_homed = True
             self._ender_cmd_q.put(("send_command", ("G90",)))
             self._ender_cmd_q.put(("send_command", ("G1 X110.00 Y110.00 F3000",)))
             self._ender_cmd_q.put(("send_command", ("G91",)))
             self.after(0, self._ender_update_pos)
-            self.after(0, lambda: self._ender_status_lbl.configure(text="Homed — at centre", text_color="green"))
+            self.after(0, lambda: self._ender_status_lbl.configure(
+                text="Homed — at centre", text_color="green"))
 
         _threading.Thread(target=_after_home, daemon=True).start()
 
@@ -736,8 +810,8 @@ class AppWindow(ctk.CTk):
             self._ender_status_lbl.configure(text="Not connected", text_color="red")
             return
         try:
-            z_disp = float(self._ender_z_disp_entry.get())
-            dwell  = float(self._ender_dwell_entry.get())
+            z_disp  = float(self._ender_z_disp_entry.get())
+            dwell   = float(self._ender_dwell_entry.get())
             n_loops = int(self._ender_loops_entry.get())
         except ValueError:
             self._ender_loop_status_lbl.configure(text="Invalid input")
@@ -745,7 +819,6 @@ class AppWindow(ctk.CTk):
         if z_disp <= 0 or dwell < 0 or n_loops < 1:
             self._ender_loop_status_lbl.configure(text="Check values")
             return
-
         self._ender_loop_stop.clear()
         self._ender_loop_running = True
         self._ender_start_loop_btn.configure(state="disabled")
