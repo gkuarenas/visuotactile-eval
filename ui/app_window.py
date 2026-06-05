@@ -9,6 +9,7 @@ import customtkinter as ctk
 from core.tracker import Tracker
 from ui.overlay import draw_overlay
 from output.writer import CSVWriter, VideoWriter, make_session_dir
+from output.heatmap import generate as generate_heatmap
 
 
 _FEED_W = 800
@@ -294,15 +295,26 @@ class AppWindow(ctk.CTk):
             return
         if self._win_active:
             self._on_stop()
+        csv_path = self.session.csv_path
+        session_dir = self.session.session_dir
         self.session.close()
         if self._last_annotated is not None:
             cv2.imwrite(self.session.png_path, self._last_annotated)
         png_path = self.session.png_path
+
+        heatmap_path: str | None = None
+        if self._last_annotated is not None:
+            h, w = self._last_annotated.shape[:2]
+            heatmap_path = generate_heatmap(csv_path, session_dir, w, h)
+
         self.session = None
         self._stop_btn.configure(state="disabled")
         self._start_btn.configure(state="normal")
         self._disable_window_widgets()
-        self._status_var.set(f"Session saved — overlay PNG: {png_path}")
+        status = f"Session saved — overlay PNG: {png_path}"
+        if heatmap_path:
+            status += f"  |  heatmap: {os.path.basename(heatmap_path)}"
+        self._status_var.set(status)
 
     def _enable_window_widgets(self) -> None:
         self.record_btn.configure(state="normal")
