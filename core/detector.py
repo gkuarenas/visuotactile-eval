@@ -5,7 +5,7 @@ from scipy.ndimage import maximum_filter
 
 def default_params() -> dict:
     return {
-        "thresh": 100,
+        "thresh": 75,
         "erode": True,
         "open": True,
         "dilate": True,

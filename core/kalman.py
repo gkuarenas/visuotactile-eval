@@ -64,3 +64,4 @@ class KalmanManager:
     def mark_autofilled(self, marker_id: int) -> None:
         s = self.states[marker_id]
         s.autofilled = True
+        s.x[2:] = 0.0  # prevent kinematic drift while no detection

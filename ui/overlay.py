@@ -34,7 +34,8 @@ def draw_overlay(
                 else:
                     color = (0, 0, 255)     # red    — large   (>= 4.0 mm)
                 cv2.arrowedLine(out, (bx, by), (ex, ey), color, 1, tipLength=tip_len)
-            cv2.circle(out, (cx, cy), 3, (200, 200, 200), 1)
+            dot_color = (0, 200, 255) if r.autofilled else (200, 200, 200)
+            cv2.circle(out, (cx, cy), 3, dot_color, 1)
         else:
             color = (0, 200, 0) if not r.autofilled else (0, 200, 255)
             cv2.circle(out, (cx, cy), 6, color, 1)
