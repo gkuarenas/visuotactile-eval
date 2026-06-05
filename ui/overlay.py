@@ -47,7 +47,7 @@ def draw_overlay(
             cv2.FONT_HERSHEY_PLAIN,
             0.7,
             (0, 255, 255),
-            2,
+            1,
         )
 
     state_str = "RECORDING" if session_active else "IDLE"
