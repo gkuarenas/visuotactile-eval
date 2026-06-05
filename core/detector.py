@@ -62,12 +62,14 @@ def detect(
     _, labels, stats, centroids = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
 
     h, w = gray.shape[:2]
+    seen_labels: set[int] = set()
     detections: list[tuple[float, float, float]] = []
     for x, y in zip(xs.tolist(), ys.tolist()):
         if 0 <= x < w and 0 <= y < h:
             label = int(labels[y, x])
-            if label == 0:
+            if label == 0 or label in seen_labels:
                 continue
+            seen_labels.add(label)
             cx, cy = centroids[label]
             area = float(stats[label, cv2.CC_STAT_AREA])
             detections.append((cx, cy, area))
