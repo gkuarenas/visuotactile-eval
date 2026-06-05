@@ -39,15 +39,6 @@ def build_log_kernel(ksize: int, sigma: float) -> np.ndarray:
     return kernel
 
 
-def _estimate_area(img: np.ndarray, cx: int, cy: int, radius: int = 12) -> float:
-    x0 = max(0, cx - radius)
-    x1 = min(img.shape[1], cx + radius)
-    y0 = max(0, cy - radius)
-    y1 = min(img.shape[0], cy + radius)
-    patch = img[y0:y1, x0:x1]
-    return float(np.count_nonzero(patch))
-
-
 def detect(
     gray: np.ndarray,
     preprocessed: np.ndarray,
@@ -68,11 +59,14 @@ def detect(
 
     ys, xs = np.where(local_max)
 
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
+
     h, w = gray.shape[:2]
     detections: list[tuple[float, float, float]] = []
     for x, y in zip(xs.tolist(), ys.tolist()):
         if 0 <= x < w and 0 <= y < h:
-            area = _estimate_area(preprocessed, x, y)
-            detections.append((float(x), float(y), float(area)))
+            label = int(labels[y, x])
+            area = float(stats[label, cv2.CC_STAT_AREA]) if label > 0 else 0.0
+            detections.append((float(x), float(y), area))
 
     return detections
