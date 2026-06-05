@@ -33,12 +33,12 @@ def draw_overlay(
                     color = (0, 140, 255)   # orange — medium  (1.5–4.0 mm)
                 else:
                     color = (0, 0, 255)     # red    — large   (>= 4.0 mm)
-                cv2.arrowedLine(out, (bx, by), (ex, ey), color, 1, tipLength=tip_len)
+                cv2.arrowedLine(out, (bx, by), (ex, ey), color, 2, tipLength=tip_len)
             dot_color = (0, 200, 255) if r.autofilled else (200, 200, 200)
-            cv2.circle(out, (cx, cy), 3, dot_color, 1)
+            cv2.circle(out, (cx, cy), 3, dot_color, 2)
         else:
             color = (0, 200, 0) if not r.autofilled else (0, 200, 255)
-            cv2.circle(out, (cx, cy), 6, color, 1)
+            cv2.circle(out, (cx, cy), 6, color, 2)
 
         cv2.putText(
             out,
@@ -46,8 +46,8 @@ def draw_overlay(
             (cx + 4, cy - 4),
             cv2.FONT_HERSHEY_PLAIN,
             0.7,
-            (255, 255, 255),
-            1,
+            (0, 255, 255),
+            2,
         )
 
     state_str = "RECORDING" if session_active else "IDLE"

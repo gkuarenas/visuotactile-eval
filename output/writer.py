@@ -13,7 +13,7 @@ COLUMNS = [
     "x", "y", "area", "dx", "dy", "dA",
     "magnitude", "dx_mm", "dy_mm", "delta_z_mm", "magnitude_mm",
     "predicted_x", "predicted_y", "autofilled",
-    "rep", "force_n", "window_type",
+    "rep", "force_n", "indenter_z_mm", "window_type",
 ]
 
 
@@ -39,7 +39,7 @@ class CSVWriter:
     def buffer_frame(self, records: list[MarkerRecord], frame_idx: int, timestamp_ms: float) -> None:
         self._pending.append((records, frame_idx, timestamp_ms))
 
-    def write_window(self, rep: int, force_n: float, window_type: str) -> None:
+    def write_window(self, rep: int, force_n: float, window_type: str, indenter_z_mm: float = 0.0) -> None:
         for records, frame_idx, ms in self._pending:
             for r in records:
                 self._w.writerow({
@@ -62,6 +62,7 @@ class CSVWriter:
                     "autofilled": r.autofilled,
                     "rep": rep,
                     "force_n": round(force_n, 3),
+                    "indenter_z_mm": round(indenter_z_mm, 3),
                     "window_type": window_type,
                 })
         self._pending = []

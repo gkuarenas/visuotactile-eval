@@ -51,6 +51,7 @@ class Tracker:
         self.params: dict = default_params()
         self.baseline_set: bool = False
         self.frame_index: int = 0
+        self._last_baseline_binary: np.ndarray | None = None
 
     def undistort(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
@@ -65,6 +66,7 @@ class Tracker:
         undistorted = self._undistort(raw_frame)
         gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
         proc = preprocess(gray, self.params)
+        self._last_baseline_binary = proc.copy()
         dets = detect(gray, proc, self.params)
 
         self.kalman.states.clear()

@@ -32,7 +32,7 @@ class AppWindow(ctk.CTk):
         self._win_active: bool = False
         self._win_total_frames: int = 0
         self._win_frames_recorded: int = 0
-        self._win_meta: tuple[int, float, str] | None = None
+        self._win_meta: tuple[int, float, str, float] | None = None
         self._video_writer: VideoWriter | None = None
         self._session_video_t0: float = 0.0
 
@@ -86,7 +86,7 @@ class AppWindow(ctk.CTk):
         slider_frame2 = ctk.CTkFrame(self)
         slider_frame2.grid(row=3, column=0, sticky="ew", **pad)
         self._add_slider(slider_frame2, "Gate px", 20, 400, 200, self._on_gate_slider, col=0)
-        self._add_slider(slider_frame2, "Threshold", 1, 255, 100, self._on_thresh_slider, col=3)
+        self._add_slider(slider_frame2, "Threshold", 1, 255, 75, self._on_thresh_slider, col=3)
 
         # Row 4 — morphology checkboxes
         morph_frame = ctk.CTkFrame(self)
@@ -106,7 +106,7 @@ class AppWindow(ctk.CTk):
         win_frame.grid(row=5, column=0, sticky="ew", **pad)
 
         ctk.CTkLabel(win_frame, text="Window Recording", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=8, padx=8, pady=(4, 2), sticky="w"
+            row=0, column=0, columnspan=10, padx=8, pady=(4, 2), sticky="w"
         )
 
         ctk.CTkLabel(win_frame, text="Rep:").grid(row=1, column=0, padx=(8, 2), sticky="e")
@@ -124,14 +124,19 @@ class AppWindow(ctk.CTk):
         self.duration_entry.grid(row=1, column=5, padx=(0, 8))
         self.duration_entry.insert(0, "5.0")
 
+        ctk.CTkLabel(win_frame, text="Indenter Z (mm):").grid(row=1, column=6, padx=(8, 2), sticky="e")
+        self.indenter_z_entry = ctk.CTkEntry(win_frame, width=60, state="disabled")
+        self.indenter_z_entry.grid(row=1, column=7, padx=(0, 8))
+        self.indenter_z_entry.insert(0, "0.0")
+
         self.window_seg = ctk.CTkSegmentedButton(
             win_frame, values=["loaded", "unloaded"], state="disabled"
         )
         self.window_seg.set("loaded")
-        self.window_seg.grid(row=1, column=6, padx=8)
+        self.window_seg.grid(row=1, column=8, padx=8)
 
         btn_sub = ctk.CTkFrame(win_frame, fg_color="transparent")
-        btn_sub.grid(row=1, column=7, padx=8)
+        btn_sub.grid(row=1, column=9, padx=8)
         self.record_btn = ctk.CTkButton(btn_sub, text="Record", width=80,
                                         state="disabled", command=self._on_record)
         self.record_btn.pack(side="left", padx=4)
@@ -279,6 +284,10 @@ class AppWindow(ctk.CTk):
             msg += f"  [WARNING: expected ~154]"
         self._status_var.set(msg)
         self._start_btn.configure(state="normal")
+        if self.tracker._last_baseline_binary is not None:
+            os.makedirs("output", exist_ok=True)
+            cv2.imwrite(os.path.join("output", "baseline_binary.png"),
+                        self.tracker._last_baseline_binary)
 
     def _on_start_session(self) -> None:
         session_dir = make_session_dir()
@@ -321,6 +330,7 @@ class AppWindow(ctk.CTk):
         self.rep_entry.configure(state="normal")
         self.force_entry.configure(state="normal")
         self.duration_entry.configure(state="normal")
+        self.indenter_z_entry.configure(state="normal")
         self.window_seg.configure(state="normal")
 
     def _disable_window_widgets(self) -> None:
@@ -329,20 +339,22 @@ class AppWindow(ctk.CTk):
         self.rep_entry.configure(state="disabled")
         self.force_entry.configure(state="disabled")
         self.duration_entry.configure(state="disabled")
+        self.indenter_z_entry.configure(state="disabled")
         self.window_seg.configure(state="disabled")
         self.progress_bar.set(0.0)
         self.timer_label.configure(text="—")
 
     def _on_record(self) -> None:
-        rep      = int(self.rep_entry.get())
-        force_n  = float(self.force_entry.get())
-        duration = float(self.duration_entry.get())
-        win_type = self.window_seg.get()
+        rep          = int(self.rep_entry.get())
+        force_n      = float(self.force_entry.get())
+        duration     = float(self.duration_entry.get())
+        win_type     = self.window_seg.get()
+        indenter_z   = float(self.indenter_z_entry.get())
 
         self._win_total_frames    = int(duration * 30)
         self._win_frames_recorded = 0
         self._win_active          = True
-        self._win_meta            = (rep, force_n, win_type)
+        self._win_meta            = (rep, force_n, win_type, indenter_z)
 
         if self._last_annotated is not None:
             h, w = self._last_annotated.shape[:2]
@@ -364,9 +376,9 @@ class AppWindow(ctk.CTk):
 
     def _complete_window(self) -> None:
         assert self._win_meta is not None
-        rep, force_n, win_type = self._win_meta
+        rep, force_n, win_type, indenter_z = self._win_meta
         self._win_active = False
-        self.session.write_window(rep, force_n, win_type)  # type: ignore[union-attr]
+        self.session.write_window(rep, force_n, win_type, indenter_z)  # type: ignore[union-attr]
         if self._video_writer is not None:
             vid_path = self._video_writer.close()
             self._video_writer = None
