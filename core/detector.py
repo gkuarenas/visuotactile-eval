@@ -59,14 +59,17 @@ def detect(
 
     ys, xs = np.where(local_max)
 
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
+    _, labels, stats, centroids = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
 
     h, w = gray.shape[:2]
     detections: list[tuple[float, float, float]] = []
     for x, y in zip(xs.tolist(), ys.tolist()):
         if 0 <= x < w and 0 <= y < h:
             label = int(labels[y, x])
-            area = float(stats[label, cv2.CC_STAT_AREA]) if label > 0 else 0.0
-            detections.append((float(x), float(y), area))
+            if label == 0:
+                continue
+            cx, cy = centroids[label]
+            area = float(stats[label, cv2.CC_STAT_AREA])
+            detections.append((cx, cy, area))
 
     return detections
