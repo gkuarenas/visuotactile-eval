@@ -47,7 +47,7 @@ class Tracker:
         self._calib_h: int = h
 
         self.kalman = KalmanManager()
-        self.gate_px: float = 200.0
+        self.gate_px: float = 280.0
         self.params: dict = default_params()
         self.baseline_set: bool = False
         self.frame_index: int = 0

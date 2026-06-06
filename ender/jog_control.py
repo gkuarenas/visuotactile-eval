@@ -90,11 +90,15 @@ class Ender3V2Controller:
             if stop_event.is_set():
                 break
             self.move_axis('Z', -z_mm)
+            if self.response_queue:
+                self.response_queue.put(("pos_update", ("Z", -z_mm)))
             for _ in range(int(dwell_s * 10)):
                 if stop_event.is_set():
                     break
                 time.sleep(0.1)
             self.move_axis('Z', +z_mm)   # always return to zero
+            if self.response_queue:
+                self.response_queue.put(("pos_update", ("Z", +z_mm)))
             if stop_event.is_set():
                 break
             time.sleep(0.3)

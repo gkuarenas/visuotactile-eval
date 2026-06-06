@@ -9,8 +9,8 @@ def default_params() -> dict:
         "erode": True,
         "open": True,
         "dilate": True,
-        "log_ksize": 61,
-        "log_sigma": 20.0,
+        "log_ksize": 55,
+        "log_sigma": 17.0,
     }
 
 

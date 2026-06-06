@@ -38,6 +38,7 @@ class AppWindow(ctk.CTk):
         self._video_path: str | None = None
 
         self._win_active: bool = False
+        self._win_loop_linked: bool = False
         self._win_total_frames: int = 0
         self._win_frames_recorded: int = 0
         self._win_meta: tuple[int, float, str, float] | None = None
@@ -131,11 +132,11 @@ class AppWindow(ctk.CTk):
         self._detection_inner = ctk.CTkFrame(rp)
         self._detection_inner.pack(side="top", fill="x", padx=6, pady=(0, 2))
 
-        self._add_slider(self._detection_inner, "LoG ksize", 3, 101, 61,
+        self._add_slider(self._detection_inner, "LoG ksize", 3, 101, 55,
                          self._on_ksize_slider, col=0, row=0, slider_width=140)
-        self._add_slider(self._detection_inner, "LoG sigma", 1.0, 30.0, 20.0,
+        self._add_slider(self._detection_inner, "LoG sigma", 1.0, 30.0, 17.0,
                          self._on_sigma_slider, col=0, row=1, fmt="{:.1f}", slider_width=140)
-        self._add_slider(self._detection_inner, "Gate px", 20, 400, 200,
+        self._add_slider(self._detection_inner, "Gate px", 20, 400, 280,
                          self._on_gate_slider, col=0, row=2, slider_width=140)
         self._add_slider(self._detection_inner, "Threshold", 1, 255, 75,
                          self._on_thresh_slider, col=0, row=3, slider_width=140)
@@ -345,9 +346,14 @@ class AppWindow(ctk.CTk):
                         if self._video_writer is not None:
                             self._video_writer.write_frame(annotated)
                         self._win_frames_recorded += 1
-                        self._update_window_progress()
-                        if self._win_frames_recorded >= self._win_total_frames:
-                            self._complete_window()
+                        if self._win_loop_linked:
+                            self.timer_label.configure(
+                                text=f"Loop recording: {self._win_frames_recorded} frames captured"
+                            )
+                        else:
+                            self._update_window_progress()
+                            if self._win_frames_recorded >= self._win_total_frames:
+                                self._complete_window()
                 else:
                     annotated = undistorted
 
@@ -491,6 +497,7 @@ class AppWindow(ctk.CTk):
             self.window_seg.set("loaded")
 
     def _on_stop(self) -> None:
+        self._win_loop_linked = False
         self._win_active = False
         if self.session is not None:
             self.session.discard_window()
@@ -701,11 +708,21 @@ class AppWindow(ctk.CTk):
                 elif msg_type == "log":
                     msg, _ = data
                     self._ender_status_lbl.configure(text=msg[:60])
+                elif msg_type == "pos_update":
+                    axis, delta = data
+                    if axis == 'Z':
+                        self._ender_z += delta
+                    self._ender_update_pos()
                 elif msg_type == "loop_done":
                     self._ender_loop_running = False
                     self._ender_start_loop_btn.configure(state="normal")
                     self._ender_stop_loop_btn.configure(state="disabled")
                     self._ender_loop_status_lbl.configure(text="Loop complete")
+                    if self._win_loop_linked and self._win_active:
+                        self._win_loop_linked = False
+                        self._complete_window()
+                        if self.session is not None:
+                            self.record_btn.configure(state="normal")
         except _queue.Empty:
             pass
         self.after(100, self._ender_process_responses)
@@ -805,6 +822,24 @@ class AppWindow(ctk.CTk):
             text=f"X: {self._ender_x:7.2f}  Y: {self._ender_y:7.2f}  Z: {self._ender_z:7.2f}"
         )
 
+    def _start_loop_recording(self, z_disp: float, n_loops: int) -> None:
+        rep     = int(self.rep_entry.get())
+        force_n = float(self.force_entry.get())
+        self._win_total_frames    = 999_999
+        self._win_frames_recorded = 0
+        self._win_active          = True
+        self._win_loop_linked     = True
+        self._win_meta            = (rep, force_n, "loop", z_disp)
+        if self._last_annotated is not None:
+            h, w = self._last_annotated.shape[:2]
+            self._video_writer = VideoWriter(
+                self.session.session_dir, rep, "loop", 30.0, (w, h)  # type: ignore[union-attr]
+            )
+        self.record_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.progress_bar.set(0.0)
+        self.timer_label.configure(text=f"Loop recording active (×{n_loops})")
+
     def _ender_start_loop(self) -> None:
         if not self._ender_connected:
             self._ender_status_lbl.configure(text="Not connected", text_color="red")
@@ -824,6 +859,8 @@ class AppWindow(ctk.CTk):
         self._ender_start_loop_btn.configure(state="disabled")
         self._ender_stop_loop_btn.configure(state="normal")
         self._ender_loop_status_lbl.configure(text=f"Running… (×{n_loops})")
+        if self.session is not None and not self._win_active:
+            self._start_loop_recording(z_disp, n_loops)
         self._ender_cmd_q.put(("run_indentation_loop", (z_disp, dwell, n_loops, self._ender_loop_stop)))
 
     def _ender_stop_loop(self) -> None:
