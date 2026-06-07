@@ -48,26 +48,25 @@ STATE_NAMES = {
 
 _RIGHT_W = 430
 _CLEARANCE_Z_MM = 3.0   # +Z clearance above the captured zero, used for all XY travel
+_Z_SETTLE_S = 0.5       # pause after Z reaches target before recording starts —
+                        # flushes in-flight camera frames and lets ringing stop
 
 
 # ── Module helpers ────────────────────────────────────────────────────────────
 
-def compute_snake_bins() -> list[tuple[int, float, float]]:
-    """Return 25 (bin_id, x_mm, y_mm) tuples in snake traversal order.
-    Origin (0,0) is slab centre. X pitch 7.04 mm, Y pitch 5.44 mm
-    (active area 35.2 x 27.2 mm — one marker-pitch inset from the 46x38 mm slab).
-    Even rows left-to-right, odd rows right-to-left.
+def compute_grid_positions() -> list[tuple[int, float, float]]:
+    """Return 5 (bin_id, x_mm, y_mm) tuples — the fixed interior measurement
+    positions, replacing the old 25-bin (5x5) grid after edge-bin marker
+    fragmentation was observed. Origin (0,0) is slab centre.
+    Visit order: C -> Q1 -> Q2 -> Q3 -> Q4.
     """
-    X = [-14.08, -7.04, 0.0, 7.04, 14.08]
-    Y = [10.88, 5.44, 0.0, -5.44, -10.88]
-    bins: list[tuple[int, float, float]] = []
-    bin_id = 1
-    for row_idx, y in enumerate(Y):
-        cols = X if row_idx % 2 == 0 else list(reversed(X))
-        for x in cols:
-            bins.append((bin_id, float(x), y))
-            bin_id += 1
-    return bins
+    return [
+        (1, 0.0, 0.0),      # C
+        (2, 11.5, 9.5),     # Q1
+        (3, -11.5, 9.5),    # Q2
+        (4, -11.5, -9.5),   # Q3
+        (5, 11.5, -9.5),    # Q4
+    ]
 
 
 def _parse_m114(response_lines: list[str]) -> tuple[float, float, float]:
@@ -94,7 +93,7 @@ class SensitivityWindow(ctk.CTk):
 
         # Core objects
         self._tracker    = Tracker("calibration.json")
-        self._snake_bins = compute_snake_bins()
+        self._bin_positions = compute_grid_positions()
         self._checkpoint = CheckpointManager()
 
         # Camera
@@ -137,7 +136,7 @@ class SensitivityWindow(ctk.CTk):
         self._grid_thread: Optional[threading.Thread] = None
         self._pause_event = threading.Event()   # soft pause — honoured between windows
         self._stop_event  = threading.Event()   # hard stop — E-Stop / Abort (kills immediately)
-        self._current_bin_idx   = 0  # index into _snake_bins
+        self._current_bin_idx   = 0  # index into _bin_positions
         self._current_rep       = 1
         self._current_level_idx = 0
         self._last_completed_bin_id = 0
@@ -383,8 +382,8 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkLabel(f, text="Grid Progress", font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(4, 2)
         )
-        self._grid_bin_var     = ctk.StringVar(value="Bin:   — / 25")
-        self._grid_rep_var     = ctk.StringVar(value="Rep:   — / 5")
+        self._grid_bin_var     = ctk.StringVar(value="Bin:   — / 5")
+        self._grid_rep_var     = ctk.StringVar(value="Rep:   — / 10")
         self._grid_level_var   = ctk.StringVar(value="Force: —")
         self._grid_frame_var   = ctk.StringVar(value="Frame: — / 30")
         self._grid_rest_var    = ctk.StringVar(value="")
@@ -797,7 +796,7 @@ class SensitivityWindow(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _grid_loop(self) -> None:
-        total_bins   = len(self._snake_bins)
+        total_bins   = len(self._bin_positions)
         skip_entry   = self._skip_bin_entry
         self._skip_bin_entry = False
 
@@ -808,7 +807,7 @@ class SensitivityWindow(ctk.CTk):
         self._ender_z = _CLEARANCE_Z_MM
         self.after(0, self._update_ender_pos_display)
 
-        for bin_entry in self._snake_bins[self._current_bin_idx:]:
+        for bin_entry in self._bin_positions[self._current_bin_idx:]:
             bin_id, x_mm, y_mm = bin_entry
 
             if self._pause_event.is_set() or self._stop_event.is_set():
@@ -836,7 +835,7 @@ class SensitivityWindow(ctk.CTk):
 
             # 3. Reps
             rep_start = self._current_rep
-            for rep in range(rep_start, 6):
+            for rep in range(rep_start, 11):
                 if self._pause_event.is_set() or self._stop_event.is_set():
                     self._current_rep = rep
                     break
@@ -856,6 +855,14 @@ class SensitivityWindow(ctk.CTk):
                     self._ender_z = z_target
                     self.after(0, self._update_ender_pos_display)
 
+                    if self._stop_event.is_set():
+                        self._current_rep       = rep
+                        self._current_level_idx = lev_idx
+                        break
+
+                    # 4b. Let the indenter settle at target Z before recording —
+                    # avoids capturing ramp-up frames from the move itself.
+                    time.sleep(_Z_SETTLE_S)
                     if self._stop_event.is_set():
                         self._current_rep       = rep
                         self._current_level_idx = lev_idx
@@ -977,12 +984,12 @@ class SensitivityWindow(ctk.CTk):
         h, rem = divmod(elapsed_s, 3600)
         m, s   = divmod(rem, 60)
         self._grid_bin_var.set(   f"Bin:   {bin_id} / {total_bins}")
-        self._grid_rep_var.set(   f"Rep:   {rep} / 5")
+        self._grid_rep_var.set(   f"Rep:   {rep} / 10")
         self._grid_level_var.set( f"Force: {label}  ({force_n:.4f} N)")
         self._grid_frame_var.set( f"Frame: {frame} / 30")
         self._grid_elapsed_var.set(f"Elapsed: {h:02d}:{m:02d}:{s:02d}")
         self._status_var.set(
-            f"STATE: GRID_RUNNING | Bin {bin_id}/{total_bins} | Rep {rep}/5 | {label} | Frame {frame}/30"
+            f"STATE: GRID_RUNNING | Bin {bin_id}/{total_bins} | Rep {rep}/10 | {label} | Frame {frame}/30"
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1123,7 +1130,7 @@ class SensitivityWindow(ctk.CTk):
         if messagebox.askyesno(
             "Resume Session",
             f"Incomplete session found:\n  Timestamp: {ts}\n"
-            f"  Last completed bin: {last}/25\n\nResume this session?",
+            f"  Last completed bin: {last}/5\n\nResume this session?",
         ):
             self._resume_checkpoint = cp
             self._status_var.set(
