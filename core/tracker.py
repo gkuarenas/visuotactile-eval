@@ -52,6 +52,13 @@ class Tracker:
         self.baseline_set: bool = False
         self.frame_index: int = 0
         self._last_baseline_binary: np.ndarray | None = None
+        self._last_undistorted: np.ndarray | None = None
+
+    @property
+    def last_undistorted(self) -> np.ndarray | None:
+        """Undistorted frame from the most recent process_frame() call —
+        overlay drawing must use this so marker coordinates line up."""
+        return self._last_undistorted
 
     def undistort(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
@@ -84,6 +91,7 @@ class Tracker:
             raise RuntimeError("Call capture_baseline() before process_frame()")
 
         undistorted = self._undistort(raw_frame)
+        self._last_undistorted = undistorted
         gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
         proc = preprocess(gray, self.params)
         dets = detect(gray, proc, self.params)
