@@ -48,6 +48,7 @@ STATE_NAMES = {
 
 _RIGHT_W = 430
 _CLEARANCE_Z_MM = 3.0   # +Z clearance above the captured zero, used for all XY travel
+_GRAVITY_MPS2 = 9.80665 # standard gravity — converts scale readings (g) to N
 _Z_SETTLE_S = 0.5       # pause after Z reaches target before recording starts —
                         # flushes in-flight camera frames and lets ringing stop
 
@@ -55,17 +56,22 @@ _Z_SETTLE_S = 0.5       # pause after Z reaches target before recording starts �
 # ── Module helpers ────────────────────────────────────────────────────────────
 
 def compute_grid_positions() -> list[tuple[int, float, float]]:
-    """Return 5 (bin_id, x_mm, y_mm) tuples — the fixed interior measurement
-    positions, replacing the old 25-bin (5x5) grid after edge-bin marker
-    fragmentation was observed. Origin (0,0) is slab centre.
-    Visit order: C -> Q1 -> Q2 -> Q3 -> Q4.
+    """Return 9 (bin_id, x_mm, y_mm) tuples — the centroids of a 3x3 division
+    of the working area (35.2 x 27.2 mm, i.e. +-17.6 mm X / +-13.6 mm Y),
+    replacing the 5-position protocol for finer spatial sensitivity/uniformity
+    sampling. Origin (0,0) is slab centre. Visit order: row-major,
+    top-left -> bottom-right.
     """
     return [
-        (1, 0.0, 0.0),      # C
-        (2, 11.5, 9.5),     # Q1
-        (3, -11.5, 9.5),    # Q2
-        (4, -11.5, -9.5),   # Q3
-        (5, 11.5, -9.5),    # Q4
+        (1, -11.733,  9.067),
+        (2,   0.0,    9.067),
+        (3,  11.733,  9.067),
+        (4, -11.733,  0.0),
+        (5,   0.0,    0.0),
+        (6,  11.733,  0.0),
+        (7, -11.733, -9.067),
+        (8,   0.0,   -9.067),
+        (9,  11.733, -9.067),
     ]
 
 
@@ -126,11 +132,13 @@ class SensitivityWindow(ctk.CTk):
         self._arduino_connected = False
         self._arduino_log: list[str] = []
 
-        # Session parameters
-        self._f_max       = 0.0
+        # Session parameters — per-bin ceiling-ramp calibration (one ramp per
+        # grid position, since F_max differs by proximity to the rigid edges)
+        self._f_max       = 0.0   # scratch values for the ramp currently being entered
         self._f_threshold = 0.0
         self._z_threshold = 0.0
-        self._force_levels: list[tuple[str, float, float]] = []  # (label, force_n, z_mm)
+        self._bin_force_levels: dict[int, list[tuple[str, float, float]]] = {}  # bin_id -> [(label, force_n, z_mm), ...]
+        self._ramp_bin_idx = 0    # index into _bin_positions for the calibration loop
 
         # Grid loop state
         self._grid_thread: Optional[threading.Thread] = None
@@ -335,26 +343,42 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkLabel(f, text="Ceiling Ramp", font=ctk.CTkFont(weight="bold")).grid(
             row=0, column=0, columnspan=3, padx=8, pady=(4, 2), sticky="w"
         )
+        self._ramp_var = ctk.StringVar(value="Ramp:  — / 9")
+        ctk.CTkLabel(f, textvariable=self._ramp_var, anchor="w",
+                     font=ctk.CTkFont(family="Courier", size=12)).grid(
+            row=1, column=0, columnspan=3, padx=8, pady=(0, 2), sticky="w"
+        )
         ctk.CTkLabel(
             f,
-            text="Jog Z down until kitchen scale reads F_threshold.\n"
-                 "Enter F_max (N) and z_threshold (mm) below.",
+            text="Indenter is positioned at this bin's centroid.\n"
+                 "Jog Z down until the scale reads F_threshold (g).\n"
+                 "Enter F_max (g) and z_threshold (mm) below.",
             justify="left", anchor="w",
-        ).grid(row=1, column=0, columnspan=3, padx=8, pady=(0, 4), sticky="w")
-        ctk.CTkLabel(f, text="F_max (N):").grid(row=2, column=0, padx=(8, 2), sticky="e")
-        self._fmax_var = ctk.StringVar()
-        self._fmax_var.trace_add("write", self._on_fmax_changed)
-        ctk.CTkEntry(f, textvariable=self._fmax_var, width=90).grid(row=2, column=1, padx=(0, 8), pady=2, sticky="w")
-        ctk.CTkLabel(f, text="F_threshold (N):").grid(row=3, column=0, padx=(8, 2), sticky="e")
+        ).grid(row=2, column=0, columnspan=3, padx=8, pady=(0, 4), sticky="w")
+        ctk.CTkLabel(f, text="F_max (g):").grid(row=3, column=0, padx=(8, 2), sticky="e")
+        self._mass_fmax_var = ctk.StringVar()
+        self._mass_fmax_var.trace_add("write", self._on_mass_fmax_changed)
+        ctk.CTkEntry(f, textvariable=self._mass_fmax_var, width=90).grid(row=3, column=1, padx=(0, 8), pady=2, sticky="w")
+        ctk.CTkLabel(f, text="F_max (N):").grid(row=4, column=0, padx=(8, 2), sticky="e")
+        self._fmax_n_var = ctk.StringVar(value="—")
+        ctk.CTkLabel(f, textvariable=self._fmax_n_var, anchor="w", width=90).grid(
+            row=4, column=1, padx=(0, 8), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(f, text="F_threshold (N):").grid(row=5, column=0, padx=(8, 2), sticky="e")
         self._fthr_var = ctk.StringVar(value="—")
         ctk.CTkLabel(f, textvariable=self._fthr_var, anchor="w", width=90).grid(
-            row=3, column=1, padx=(0, 8), pady=2, sticky="w"
+            row=5, column=1, padx=(0, 8), pady=2, sticky="w"
         )
-        ctk.CTkLabel(f, text="z_threshold (mm):").grid(row=4, column=0, padx=(8, 2), sticky="e")
+        ctk.CTkLabel(f, text="F_threshold (g):").grid(row=6, column=0, padx=(8, 2), sticky="e")
+        self._mass_fthr_var = ctk.StringVar(value="—")
+        ctk.CTkLabel(f, textvariable=self._mass_fthr_var, anchor="w", width=90).grid(
+            row=6, column=1, padx=(0, 8), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(f, text="z_threshold (mm):").grid(row=7, column=0, padx=(8, 2), sticky="e")
         self._zthr_var = ctk.StringVar()
-        ctk.CTkEntry(f, textvariable=self._zthr_var, width=90).grid(row=4, column=1, padx=(0, 8), pady=2, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._zthr_var, width=90).grid(row=7, column=1, padx=(0, 8), pady=2, sticky="w")
         ctk.CTkButton(f, text="Confirm", width=100, command=self._on_confirm_ceiling).grid(
-            row=5, column=0, columnspan=2, padx=8, pady=(4, 6), sticky="w"
+            row=8, column=0, columnspan=2, padx=8, pady=(4, 6), sticky="w"
         )
         return f
 
@@ -382,7 +406,7 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkLabel(f, text="Grid Progress", font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(4, 2)
         )
-        self._grid_bin_var     = ctk.StringVar(value="Bin:   — / 5")
+        self._grid_bin_var     = ctk.StringVar(value="Bin:   — / 9")
         self._grid_rep_var     = ctk.StringVar(value="Rep:   — / 10")
         self._grid_level_var   = ctk.StringVar(value="Force: —")
         self._grid_frame_var   = ctk.StringVar(value="Frame: — / 30")
@@ -671,19 +695,19 @@ class SensitivityWindow(ctk.CTk):
         self._jog_status_lbl.configure(text=msg)
 
         if self._resume_checkpoint:
-            # Pre-fill from checkpoint and skip CEILING_RAMP
-            self._f_threshold = self._resume_checkpoint["f_threshold"]
-            self._z_threshold = self._resume_checkpoint["z_threshold"]
-            self._force_levels = [
-                (k, v["force_n"], v["z_mm"])
-                for k, v in self._resume_checkpoint["force_levels"].items()
-            ]
+            # Pre-fill per-bin calibration from checkpoint and skip the ramp
+            # sequence entirely — calibration is always complete before any
+            # measurement bin starts, so go straight to GRID_RUNNING.
+            self._bin_force_levels = {
+                int(bid): [(lbl, v["force_n"], v["z_mm"]) for lbl, v in levels.items()]
+                for bid, levels in self._resume_checkpoint["bin_force_levels"].items()
+            }
             self._current_bin_idx = self._resume_checkpoint["last_completed_bin"]
             self._last_completed_bin_id = self._resume_checkpoint["last_completed_bin"]
-            self._populate_force_display()
-            self._set_state(FORCE_ENTRY)
+            self._launch_grid()
         else:
-            self._set_state(CEILING_RAMP)
+            self._ramp_bin_idx = 0
+            self._begin_ceiling_ramp()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Jog panel
@@ -723,30 +747,38 @@ class SensitivityWindow(ctk.CTk):
     # CEILING_RAMP handlers
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _on_fmax_changed(self, *_) -> None:
+    def _on_mass_fmax_changed(self, *_) -> None:
         try:
-            self._fthr_var.set(f"{0.90 * float(self._fmax_var.get()):.4f}")
+            mass_g = float(self._mass_fmax_var.get())
+            f_max_n = (mass_g / 1000.0) * _GRAVITY_MPS2
+            self._fmax_n_var.set(f"{f_max_n:.4f}")
+            self._fthr_var.set(f"{0.90 * f_max_n:.4f}")
+            self._mass_fthr_var.set(f"{0.90 * mass_g:.4f}")
         except ValueError:
+            self._fmax_n_var.set("—")
             self._fthr_var.set("—")
+            self._mass_fthr_var.set("—")
 
     def _on_confirm_ceiling(self) -> None:
         try:
-            f_max = float(self._fmax_var.get())
+            mass_fmax_g = float(self._mass_fmax_var.get())
             z_thr = float(self._zthr_var.get())
         except ValueError:
             messagebox.showerror("Input Error", "F_max and z_threshold must be numbers.")
             return
-        if f_max <= 0 or z_thr >= 0:
+        if mass_fmax_g <= 0 or z_thr >= 0:
             messagebox.showerror(
                 "Input Error",
                 "F_max must be > 0 and z_threshold must be negative "
                 "(indentation moves toward negative Z from the captured zero).",
             )
             return
+        f_max = (mass_fmax_g / 1000.0) * _GRAVITY_MPS2
         self._f_max       = f_max
         self._f_threshold = 0.90 * f_max
         self._z_threshold = z_thr
-        self._force_levels = self._compute_force_levels()
+        bin_id = self._bin_positions[self._ramp_bin_idx][0]
+        self._bin_force_levels[bin_id] = self._compute_force_levels()
         self._populate_force_display()
         self._set_state(FORCE_ENTRY)
 
@@ -759,14 +791,79 @@ class SensitivityWindow(ctk.CTk):
         return levels
 
     def _populate_force_display(self) -> None:
-        for i, (label, force_n, z_mm) in enumerate(self._force_levels):
+        bin_id = self._bin_positions[self._ramp_bin_idx][0]
+        for i, (label, force_n, z_mm) in enumerate(self._bin_force_levels[bin_id]):
             self._level_vars[i].set(f"{label}: {force_n:.4f} N  |  Z: {z_mm:.3f} mm")
+        is_last = self._ramp_bin_idx == len(self._bin_positions) - 1
+        self._start_grid_btn.configure(text="Start Grid" if is_last else "Next Position")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # FORCE_ENTRY — start grid
+    # CEILING_RAMP loop — one ramp per grid position
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _begin_ceiling_ramp(self) -> None:
+        bin_id, x_mm, y_mm = self._bin_positions[self._ramp_bin_idx]
+        n = len(self._bin_positions)
+
+        # Force absolute mode FIRST — the operator just jogged Z down with the
+        # relative-mode jog buttons (move_axis sends G91 and never restores
+        # G90), so without this the retraction below would be interpreted as
+        # a relative +3mm nudge from the pressed-in position, not an absolute
+        # move to clearance height.
+        self._ender_sync_cmd("G90", timeout=10.0)
+
+        # Retract to clearance before any XY travel — the operator just jogged
+        # Z down to find F_threshold, so the indenter may still be pressed
+        # into the elastomer. Without this it would drag across the surface
+        # while moving to the next bin's centroid.
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=10.0)
+        self._ender_sync_cmd("M400")
+        self._ender_z = _CLEARANCE_Z_MM
+        self._update_ender_pos_display()
+
+        # Move indenter to this bin's centroid before the operator ramps —
+        # F_max/z_threshold are local to each position (proximity to the
+        # rigid support edges changes how much force the elastomer tolerates).
+        self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000")
+        self._ender_sync_cmd("M400")
+        self._ender_x, self._ender_y = x_mm, y_mm
+        self._update_ender_pos_display()
+
+        # Descend back to the origin contact-height reference (Z=0) so the
+        # operator starts every bin's manual ramp-down from the same known
+        # height, rather than from +3mm clearance.
+        self._ender_sync_cmd("G1 Z0.000 F300", timeout=10.0)
+        self._ender_sync_cmd("M400")
+        self._ender_z = 0.0
+        self._update_ender_pos_display()
+
+        self._mass_fmax_var.set("")
+        self._zthr_var.set("")
+        self._fmax_n_var.set("—")
+        self._fthr_var.set("—")
+        self._mass_fthr_var.set("—")
+        self._ramp_var.set(
+            f"Ramp {self._ramp_bin_idx + 1} / {n}  —  Bin {bin_id}  "
+            f"(X {x_mm:.3f}, Y {y_mm:.3f})"
+        )
+        self._set_state(CEILING_RAMP)
+        self._status_var.set(
+            f"STATE: CEILING_RAMP — ramp {self._ramp_bin_idx + 1}/{n} "
+            f"at bin {bin_id} (X {x_mm:.3f}, Y {y_mm:.3f})"
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FORCE_ENTRY — advance ramp sequence or start grid
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_start_grid(self) -> None:
+        if self._ramp_bin_idx < len(self._bin_positions) - 1:
+            self._ramp_bin_idx += 1
+            self._begin_ceiling_ramp()
+            return
+        self._launch_grid()
+
+    def _launch_grid(self) -> None:
         if self._resume_checkpoint:
             self._session_dir = self._resume_checkpoint["session_dir"]
             self._session_ts  = self._resume_checkpoint["session_ts"]
@@ -840,14 +937,15 @@ class SensitivityWindow(ctk.CTk):
                     self._current_rep = rep
                     break
 
+                bin_levels = self._bin_force_levels[bin_id]
                 lev_start = self._current_level_idx if rep == rep_start else 0
-                for lev_idx in range(lev_start, len(self._force_levels)):
+                for lev_idx in range(lev_start, len(bin_levels)):
                     if self._pause_event.is_set() or self._stop_event.is_set():
                         self._current_rep       = rep
                         self._current_level_idx = lev_idx
                         break
 
-                    label, force_n, z_target = self._force_levels[lev_idx]
+                    label, force_n, z_target = bin_levels[lev_idx]
 
                     # 4. Move Z to target
                     self._ender_sync_cmd(f"G1 Z{z_target:.3f} F300")
@@ -899,10 +997,10 @@ class SensitivityWindow(ctk.CTk):
                 session_dir=self._session_dir,
                 session_ts=self._session_ts,
                 last_completed_bin=bin_id,
-                f_threshold=self._f_threshold,
-                z_threshold=self._z_threshold,
-                force_levels={lbl: {"force_n": fn, "z_mm": zm}
-                              for lbl, fn, zm in self._force_levels},
+                bin_force_levels={
+                    bid: {lbl: {"force_n": fn, "z_mm": zm} for lbl, fn, zm in levels}
+                    for bid, levels in self._bin_force_levels.items()
+                },
                 csv_path=self._writer.csv_path if self._writer else "",
             )
             self._current_bin_idx += 1
@@ -1027,10 +1125,10 @@ class SensitivityWindow(ctk.CTk):
                 session_dir=self._session_dir,
                 session_ts=self._session_ts,
                 last_completed_bin=self._last_completed_bin_id,
-                f_threshold=self._f_threshold,
-                z_threshold=self._z_threshold,
-                force_levels={lbl: {"force_n": fn, "z_mm": zm}
-                              for lbl, fn, zm in self._force_levels},
+                bin_force_levels={
+                    bid: {lbl: {"force_n": fn, "z_mm": zm} for lbl, fn, zm in levels}
+                    for bid, levels in self._bin_force_levels.items()
+                },
                 csv_path=self._writer.csv_path,
             )
             self._writer = None
@@ -1047,17 +1145,17 @@ class SensitivityWindow(ctk.CTk):
         self._session_ts = ""
         self._resume_checkpoint = None
 
-        # Clear ceiling/force params — operator re-measures every time
+        # Clear ceiling/force params — operator re-measures every position
         self._f_max = self._f_threshold = self._z_threshold = 0.0
-        self._force_levels = []
-        self._fmax_var.set("")
-        self._zthr_var.set("")
+        self._bin_force_levels = {}
+        self._ramp_bin_idx = 0
         for i, v in enumerate(self._level_vars):
             v.set(f"L{i + 1}: — N  |  Z: — mm")
 
-        self._set_state(CEILING_RAMP)
+        self._begin_ceiling_ramp()
         self._status_var.set(
-            "STATE: CEILING_RAMP — aborted; baseline retained, re-measure to restart"
+            "STATE: CEILING_RAMP — aborted; baseline retained, "
+            "re-measure every position to restart"
         )
 
     def _on_estop(self) -> None:
@@ -1130,7 +1228,7 @@ class SensitivityWindow(ctk.CTk):
         if messagebox.askyesno(
             "Resume Session",
             f"Incomplete session found:\n  Timestamp: {ts}\n"
-            f"  Last completed bin: {last}/5\n\nResume this session?",
+            f"  Last completed bin: {last}/9\n\nResume this session?",
         ):
             self._resume_checkpoint = cp
             self._status_var.set(

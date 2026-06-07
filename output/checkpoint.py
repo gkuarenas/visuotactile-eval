@@ -11,17 +11,13 @@ class CheckpointManager:
         session_dir: str,
         session_ts: str,
         last_completed_bin: int,
-        f_threshold: float,
-        z_threshold: float,
-        force_levels: dict,
+        bin_force_levels: dict,
         csv_path: str,
     ) -> None:
         payload = {
             "session_ts": session_ts,
             "last_completed_bin": last_completed_bin,
-            "f_threshold": round(f_threshold, 6),
-            "z_threshold": round(z_threshold, 6),
-            "force_levels": force_levels,
+            "bin_force_levels": bin_force_levels,
             "csv_path": csv_path,
         }
         tmp = os.path.join(session_dir, self.TMPFILE)
@@ -51,7 +47,7 @@ class CheckpointManager:
             if not os.path.isdir(folder):
                 continue
             cp = self.load(folder)
-            if cp is not None and cp.get("last_completed_bin", 25) < 25:
+            if cp is not None and cp.get("last_completed_bin", 9) < 9:
                 candidates.append(cp)
         if not candidates:
             return None
