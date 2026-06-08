@@ -22,7 +22,7 @@ import serial
 from core.tracker import Tracker, MarkerRecord
 from ui.overlay import draw_overlay
 from ender.jog_control import Ender3V2Controller
-from output.sensitivity_writer import SensitivityWriter
+from output.sensitivity_writer import SensitivityWriter, write_marker_baselines
 from output.checkpoint import CheckpointManager
 
 
@@ -59,19 +59,22 @@ def compute_grid_positions() -> list[tuple[int, float, float]]:
     """Return 9 (bin_id, x_mm, y_mm) tuples — the centroids of a 3x3 division
     of the working area (35.2 x 27.2 mm, i.e. +-17.6 mm X / +-13.6 mm Y),
     replacing the 5-position protocol for finer spatial sensitivity/uniformity
-    sampling. Origin (0,0) is slab centre. Visit order: row-major,
-    top-left -> bottom-right.
+    sampling. Origin (0,0) is slab centre, but sensitivity_analysis.ipynb's
+    marker-baseline-vs-bin plot showed the camera is not perfectly centred on
+    the slab, so the whole grid is translated 1.2 mm in -Y to keep the
+    boundary elastomers in bins 7-9 inside their intended cells. Visit order:
+    row-major, top-left -> bottom-right.
     """
     return [
-        (1, -11.733,  9.067),
-        (2,   0.0,    9.067),
-        (3,  11.733,  9.067),
-        (4, -11.733,  0.0),
-        (5,   0.0,    0.0),
-        (6,  11.733,  0.0),
-        (7, -11.733, -9.067),
-        (8,   0.0,   -9.067),
-        (9,  11.733, -9.067),
+        (1, -11.733,   7.867),
+        (2,   0.0,     7.867),
+        (3,  11.733,   7.867),
+        (4, -11.733,  -1.2),
+        (5,   0.0,    -1.2),
+        (6,  11.733,  -1.2),
+        (7, -11.733, -10.267),
+        (8,   0.0,   -10.267),
+        (9,  11.733, -10.267),
     ]
 
 
@@ -876,6 +879,12 @@ class SensitivityWindow(ctk.CTk):
             self._session_dir = os.path.join("output", "sessions",
                                              f"{self._session_ts}_sensitivity")
             self._writer = SensitivityWriter(self._session_dir)
+
+        # Baseline is always recaptured immediately before _launch_grid runs
+        # (see _on_capture_baseline), so this reflects the markers' current
+        # physical layout for this run -- write/overwrite unconditionally.
+        write_marker_baselines(self._session_dir, self._session_ts,
+                               self._tracker.baseline_positions_mm)
 
         self._session_start_t = time.time()
         self._pause_event.clear()

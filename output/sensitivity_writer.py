@@ -1,8 +1,44 @@
 import csv
+import json
 import os
 from datetime import datetime
 
 from core.tracker import MarkerRecord
+
+
+FRAME_ASSUMPTION = (
+    "Camera principal point (cx, cy from calibration.json K) is assumed to "
+    "coincide with the G92 machine origin (X0 Y0) -- both are physically the "
+    "slab centre by design. This is an unverified simplification; cross-check "
+    "it empirically in sensitivity_analysis.ipynb (peak-responding markers per "
+    "bin should land near that bin's bin_x_mm/bin_y_mm under these baselines)."
+)
+
+
+def write_marker_baselines(
+    session_dir: str,
+    session_ts: str,
+    baseline_positions_mm: dict[int, tuple[float, float]],
+) -> str:
+    """Write each marker's baseline (x_mm, y_mm) to a small one-time companion
+    JSON file next to the session CSV. Baseline positions are constant across
+    a session's ~1.66M rows, so they are exported once here rather than as
+    per-row CSV columns (which would be heavily redundant)."""
+    payload = {
+        "frame_assumption": FRAME_ASSUMPTION,
+        "markers": {
+            str(marker_id): {"baseline_x_mm": round(x_mm, 4), "baseline_y_mm": round(y_mm, 4)}
+            for marker_id, (x_mm, y_mm) in sorted(baseline_positions_mm.items())
+        },
+    }
+    os.makedirs(session_dir, exist_ok=True)
+    filename = f"marker_baselines_{session_ts}.json"
+    tmp = os.path.join(session_dir, f"{filename}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    final = os.path.join(session_dir, filename)
+    os.replace(tmp, final)
+    return final
 
 
 SENSITIVITY_COLUMNS = [

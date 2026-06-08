@@ -39,6 +39,8 @@ class Tracker:
         w, h = data["image_size"]               # [width, height] — width is index 0
         self._fx: float = float(K[0, 0])
         self._fy: float = float(K[1, 1])
+        self._cx: float = float(K[0, 2])
+        self._cy: float = float(K[1, 2])
 
         self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(
             K, D, np.eye(3), K, (w, h), cv2.CV_16SC2
@@ -50,6 +52,7 @@ class Tracker:
         self.gate_px: float = 280.0
         self.params: dict = default_params()
         self.baseline_set: bool = False
+        self.baseline_positions_mm: dict[int, tuple[float, float]] = {}
         self.frame_index: int = 0
         self._last_baseline_binary: np.ndarray | None = None
         self._last_undistorted: np.ndarray | None = None
@@ -79,6 +82,20 @@ class Tracker:
         self.kalman.states.clear()
         for i, (x, y, area) in enumerate(dets):
             self.kalman.init_state(i, x, y, area)
+
+        # Baseline positions converted to mm, ASSUMING the camera principal
+        # point (cx, cy) coincides with the G92 machine origin (X0 Y0) — both
+        # are physically the slab centre by design. Uses the same per-axis
+        # px->mm scale factor (H_MM / f) the pipeline already applies to
+        # deltas (see core/zdisplacement.compute). The X term is negated:
+        # empirically confirmed via sensitivity_analysis.ipynb's spatial
+        # cross-check that the camera's pixel-X axis is mirrored relative to
+        # the G92 machine X-axis (Y is not mirrored).
+        self.baseline_positions_mm = {
+            sid: (-(s.baseline_pos[0] - self._cx) * (zdisplacement.H_MM / self._fx),
+                   (s.baseline_pos[1] - self._cy) * (zdisplacement.H_MM / self._fy))
+            for sid, s in self.kalman.states.items()
+        }
 
         self.baseline_set = True
         count = len(dets)
