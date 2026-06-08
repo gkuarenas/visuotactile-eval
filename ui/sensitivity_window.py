@@ -8,6 +8,7 @@ import re
 import time
 import queue
 import threading
+from collections import deque
 from datetime import datetime
 from typing import Optional
 
@@ -16,14 +17,23 @@ import numpy as np
 from PIL import Image, ImageTk
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 import serial
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import scienceplots  # noqa: F401  (registers the "science"/"no-latex" styles)
 
 from core.tracker import Tracker, MarkerRecord
 from ui.overlay import draw_overlay
 from ender.jog_control import Ender3V2Controller
-from output.sensitivity_writer import SensitivityWriter, write_marker_baselines
-from output.checkpoint import CheckpointManager
+from output.sensitivity_writer import (
+    SensitivityWriter, write_marker_baselines,
+    SensitivityWriterV4, write_sensitivity_summary,
+    write_z_thresh_map, load_z_thresh_map,
+)
+from output.checkpoint import CheckpointManager, CheckpointManagerV4
 
 
 # ── State constants ──────────────────────────────────────────────────────────
@@ -36,6 +46,14 @@ GRID_RUNNING = 4
 PAUSED       = 5
 COMPLETE     = 6
 
+# v4 protocol states — branch off BASELINE; v3 states/UI stay intact
+V4_CONFIG           = 7
+V4_CALIBRATING      = 8
+V4_CALIBRATION_DONE = 9
+V4_COLLECTING       = 10
+V4_PAUSED           = 11
+V4_COMPLETE         = 12
+
 STATE_NAMES = {
     STARTUP:      "STARTUP",
     BASELINE:     "BASELINE",
@@ -44,6 +62,12 @@ STATE_NAMES = {
     GRID_RUNNING: "GRID_RUNNING",
     PAUSED:       "PAUSED",
     COMPLETE:     "COMPLETE",
+    V4_CONFIG:           "V4_CONFIG",
+    V4_CALIBRATING:      "V4_CALIBRATING",
+    V4_CALIBRATION_DONE: "V4_CALIBRATION_DONE",
+    V4_COLLECTING:       "V4_COLLECTING",
+    V4_PAUSED:           "V4_PAUSED",
+    V4_COMPLETE:         "V4_COMPLETE",
 }
 
 _RIGHT_W = 430
@@ -51,6 +75,33 @@ _CLEARANCE_Z_MM = 3.0   # +Z clearance above the captured zero, used for all XY 
 _GRAVITY_MPS2 = 9.80665 # standard gravity — converts scale readings (g) to N
 _Z_SETTLE_S = 0.5       # pause after Z reaches target before recording starts —
                         # flushes in-flight camera frames and lets ringing stop
+
+# ── v4 protocol constants ────────────────────────────────────────────────────
+
+_GRID_7X5_COLS = 7
+_GRID_7X5_ROWS = 5
+_GRID_7X5_WORK_W_MM = 35.2
+_GRID_7X5_WORK_H_MM = 27.2
+# Reuse the empirically-derived camera/slab correction found for the 3x3 grid
+# (-1.2 mm in Y, commit d031f19) — same physical rig, so the same misalignment
+# applies. Re-verify at 7x5 resolution via sensitivity_analysis.ipynb's
+# marker-baseline-vs-bin cross-check (todo_v4.md Step 4) before relying on it
+# for finely-pitched boundary bins (B01-B07 / B29-B35 / edge columns).
+_GRID_7X5_Y_OFFSET_MM = -1.2
+_GRID_7X5_X_OFFSET_MM = 0.0
+
+DRIFT_GATE_PX     = 2.0   # max allowed mean per-marker centroid drift before a bin (px)
+Z_HARD_LIMIT_MM   = 10.0  # absolute descent depth limit during the ceiling ramp (mm)
+_RAMP_RETRACT_MM  = 1.0   # clearance retracted past the Z=0 contact reference after each ramp
+_TRACKING_LOSS_STRIKES = 3  # consecutive mid-press tracking-loss reps before a bin is skipped
+
+# Load-cell (HX711) telemetry — streamed continuously by a dedicated second
+# Arduino, asynchronously and at a much higher rate than the 30 fps camera.
+# Readings are buffered with timestamps and sampled by wall-clock window rather
+# than matched 1:1 to frames, so the exact stream rate doesn't matter.
+_SCALE_BAUD = 57600
+_SCALE_BUFFER_MAXLEN = 2000     # ring buffer capacity (~25 s of headroom at 80 Hz)
+_SCALE_SAMPLE_WINDOW_S = 0.2    # trailing window averaged for a single-point sample
 
 
 # ── Module helpers ────────────────────────────────────────────────────────────
@@ -76,6 +127,47 @@ def compute_grid_positions() -> list[tuple[int, float, float]]:
         (8,   0.0,   -10.267),
         (9,  11.733, -10.267),
     ]
+
+
+def compute_grid_positions_7x5() -> list[dict]:
+    """Return 35 bin dicts {bin_id, col, row, x_mm, y_mm} — a 7 (cols) x 5 (rows)
+    division of the working area (35.2 x 27.2 mm), bin size ~5.029 x 5.44 mm.
+    Numbered row-major B01 (top-left, col=0,row=0) -> B35 (bottom-right,
+    col=6,row=4); (col=3, row=2) is the bin closest to slab centre (0,0) before
+    the empirical -1.2 mm Y correction (mirrors compute_grid_positions' offset —
+    same camera/slab, see _GRID_7X5_Y_OFFSET_MM)."""
+    cell_w = _GRID_7X5_WORK_W_MM / _GRID_7X5_COLS
+    cell_h = _GRID_7X5_WORK_H_MM / _GRID_7X5_ROWS
+    bins: list[dict] = []
+    for row in range(_GRID_7X5_ROWS):
+        for col in range(_GRID_7X5_COLS):
+            bin_id = row * _GRID_7X5_COLS + col + 1
+            x_mm = -_GRID_7X5_WORK_W_MM / 2.0 + (col + 0.5) * cell_w + _GRID_7X5_X_OFFSET_MM
+            y_mm = _GRID_7X5_WORK_H_MM / 2.0 - (row + 0.5) * cell_h + _GRID_7X5_Y_OFFSET_MM
+            bins.append({
+                "bin_id": bin_id, "col": col, "row": row,
+                "x_mm": x_mm, "y_mm": y_mm,
+            })
+    return bins
+
+
+def boustrophedon_order(bins: list[dict]) -> list[dict]:
+    """Re-order bins for snake (boustrophedon) traversal: even rows visited
+    left -> right (col 0->6), odd rows right -> left (col 6->0). Bin
+    *numbering* stays row-major (B01..B35) — only visit order snakes."""
+    by_row: dict[int, list[dict]] = {}
+    for b in bins:
+        by_row.setdefault(b["row"], []).append(b)
+    ordered: list[dict] = []
+    for row in sorted(by_row):
+        row_bins = sorted(by_row[row], key=lambda b: b["col"])
+        if row % 2 == 1:
+            row_bins = list(reversed(row_bins))
+        ordered.extend(row_bins)
+    return ordered
+
+
+GRID_7X5: list[dict] = boustrophedon_order(compute_grid_positions_7x5())
 
 
 def _parse_m114(response_lines: list[str]) -> tuple[float, float, float]:
@@ -135,6 +227,12 @@ class SensitivityWindow(ctk.CTk):
         self._arduino_connected = False
         self._arduino_log: list[str] = []
 
+        # Load-cell Arduino serial (HX711_ADC, separate device, continuous stream)
+        self._scale_arduino: Optional[serial.Serial] = None
+        self._scale_connected = False
+        self._scale_buffer: deque[tuple[float, float]] = deque(maxlen=_SCALE_BUFFER_MAXLEN)
+        self._scale_lock = threading.Lock()
+
         # Session parameters — per-bin ceiling-ramp calibration (one ramp per
         # grid position, since F_max differs by proximity to the rigid edges)
         self._f_max       = 0.0   # scratch values for the ramp currently being entered
@@ -163,11 +261,25 @@ class SensitivityWindow(ctk.CTk):
         # Resume
         self._resume_checkpoint: Optional[dict] = None
 
+        # ── v4 protocol state ─────────────────────────────────────────────
+        self._checkpoint_v4 = CheckpointManagerV4()
+        self._v4_blend_id = ""
+        self._v4_phase = ""   # "calibration" | "collection" | "complete"
+        self._v4_z_thresh_map: dict[int, dict] = {}   # bin_id -> {x_mm,y_mm,z_max_mm,z_thresh_mm,f_max_n,f_thresh_n}
+        self._v4_z_thresh_map_path = ""
+        self._v4_completed_reps: dict[int, set[int]] = {}
+        self._v4_skipped_bins: set[int] = set()
+        self._v4_summary_csv_path = ""
+        self._v4_resume_checkpoint: Optional[dict] = None
+        self._v4_thread: Optional[threading.Thread] = None
+        self._writer_v4: Optional[SensitivityWriterV4] = None
+
         # State
         self._state = STARTUP
 
         self._build_ui()
         self._check_for_resume()
+        self._check_for_v4_resume()
         self._frame_loop()
         self._ender_process_responses()
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -210,6 +322,7 @@ class SensitivityWindow(ctk.CTk):
         self._force_section         = self._build_force_section(rp)
         self._grid_progress_section = self._build_grid_progress_section(rp)
         self._session_controls      = self._build_session_controls(rp)
+        self._v4_section            = self._build_v4_section(rp)
 
         # Ordered list used by _apply_visibility for deterministic pack order
         self._rp_sections = [
@@ -221,6 +334,7 @@ class SensitivityWindow(ctk.CTk):
             self._ceiling_section,
             self._force_section,
             self._grid_progress_section,
+            self._v4_section,
             self._session_controls,
         ]
         self._apply_visibility()
@@ -240,15 +354,20 @@ class SensitivityWindow(ctk.CTk):
         self._arduino_port_var = ctk.StringVar(value="COM7")
         ctk.CTkComboBox(f, variable=self._arduino_port_var, values=["COM7", "COM8"],
                         width=90, state="readonly").grid(row=1, column=3, padx=(0, 8), pady=2)
-        ctk.CTkLabel(f, text="Camera index:").grid(row=2, column=0, padx=(8, 2), pady=2, sticky="e")
+        ctk.CTkLabel(f, text="Load cell:").grid(row=2, column=2, padx=(8, 2), sticky="e")
+        self._scale_port_var = ctk.StringVar(value="COM9")
+        ctk.CTkComboBox(f, variable=self._scale_port_var,
+                        values=["COM9", "COM10", "COM11", "COM12"],
+                        width=90, state="normal").grid(row=2, column=3, padx=(0, 8), pady=2)
+        ctk.CTkLabel(f, text="Camera index:").grid(row=3, column=0, padx=(8, 2), pady=2, sticky="e")
         self._cam_entry = ctk.CTkEntry(f, width=50)
         self._cam_entry.insert(0, "1")
-        self._cam_entry.grid(row=2, column=1, padx=(0, 8), pady=2, sticky="w")
+        self._cam_entry.grid(row=3, column=1, padx=(0, 8), pady=2, sticky="w")
 
         self._connect_btn = ctk.CTkButton(f, text="Connect", width=110, command=self._on_connect)
-        self._connect_btn.grid(row=3, column=0, columnspan=2, padx=8, pady=(2, 6), sticky="w")
+        self._connect_btn.grid(row=4, column=0, columnspan=2, padx=8, pady=(2, 6), sticky="w")
         self._com_status_lbl = ctk.CTkLabel(f, text="", anchor="w")
-        self._com_status_lbl.grid(row=3, column=2, columnspan=2, padx=8, sticky="w")
+        self._com_status_lbl.grid(row=4, column=2, columnspan=2, padx=8, sticky="w")
         return f
 
     def _build_arduino_section(self, parent) -> ctk.CTkFrame:
@@ -381,8 +500,14 @@ class SensitivityWindow(ctk.CTk):
         self._zthr_var = ctk.StringVar()
         ctk.CTkEntry(f, textvariable=self._zthr_var, width=90).grid(row=7, column=1, padx=(0, 8), pady=2, sticky="w")
         ctk.CTkButton(f, text="Confirm", width=100, command=self._on_confirm_ceiling).grid(
-            row=8, column=0, columnspan=2, padx=8, pady=(4, 6), sticky="w"
+            row=8, column=0, columnspan=2, padx=8, pady=(4, 2), sticky="w"
         )
+        self._ramp_back_btn = ctk.CTkButton(
+            f, text="Back to Baseline", width=140,
+            fg_color="gray40", hover_color="gray30",
+            command=self._on_ramp_back_to_baseline,
+        )
+        self._ramp_back_btn.grid(row=9, column=0, columnspan=2, padx=8, pady=(0, 6), sticky="w")
         return f
 
     def _build_force_section(self, parent) -> ctk.CTkFrame:
@@ -440,6 +565,64 @@ class SensitivityWindow(ctk.CTk):
         self._abort_btn.pack(side="left")
         return f
 
+    def _build_v4_section(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent)
+        ctk.CTkLabel(f, text="Sensitivity v4", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky="w"
+        )
+        self._v4_enabled_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(f, text="Use v4 protocol for this session",
+                        variable=self._v4_enabled_var).grid(
+            row=0, column=2, columnspan=2, padx=8, pady=(4, 2), sticky="e"
+        )
+        ctk.CTkLabel(f, text="Blend ID:").grid(row=1, column=0, padx=(8, 2), sticky="e")
+        self._v4_blend_id_var = ctk.StringVar(value="")
+        ctk.CTkEntry(f, textvariable=self._v4_blend_id_var, width=110).grid(
+            row=1, column=1, padx=(0, 8), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(f, text="N Reps:").grid(row=1, column=2, padx=(8, 2), sticky="e")
+        self._v4_n_reps_var = tk.IntVar(value=10)
+        ctk.CTkEntry(f, textvariable=self._v4_n_reps_var, width=60).grid(
+            row=1, column=3, padx=(0, 8), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(f, text="Z Step (mm):").grid(row=2, column=0, padx=(8, 2), sticky="e")
+        self._v4_z_step_var = tk.DoubleVar(value=0.1)
+        ctk.CTkEntry(f, textvariable=self._v4_z_step_var, width=60).grid(
+            row=2, column=1, padx=(0, 8), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(f, text="Z Retract (mm):").grid(row=2, column=2, padx=(8, 2), sticky="e")
+        self._v4_z_retract_var = tk.DoubleVar(value=5.0)
+        ctk.CTkEntry(f, textvariable=self._v4_z_retract_var, width=60).grid(
+            row=2, column=3, padx=(0, 8), pady=2, sticky="w"
+        )
+
+        br = ctk.CTkFrame(f, fg_color="transparent")
+        br.grid(row=3, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w")
+        self._v4_calib_btn = ctk.CTkButton(br, text="Calibration", width=104, command=self._on_v4_calibration)
+        self._v4_calib_btn.pack(side="left", padx=(0, 6))
+        self._v4_run_btn = ctk.CTkButton(br, text="Run Sensitivity", width=128,
+                                         state="disabled", command=self._on_v4_run_sensitivity)
+        self._v4_run_btn.pack(side="left", padx=(0, 6))
+        self._v4_load_btn = ctk.CTkButton(br, text="Load Calibration", width=128,
+                                          command=self._on_v4_load_calibration)
+        self._v4_load_btn.pack(side="left")
+
+        self._v4_progress_var = ctk.StringVar(value="")
+        ctk.CTkLabel(f, textvariable=self._v4_progress_var, anchor="w",
+                     font=ctk.CTkFont(family="Courier", size=11), wraplength=_RIGHT_W - 20).grid(
+            row=4, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+        )
+        self._v4_progress_bar = ctk.CTkProgressBar(f, width=_RIGHT_W - 60)
+        self._v4_progress_bar.set(0.0)
+        self._v4_progress_bar.grid(row=5, column=0, columnspan=4, padx=8, pady=(2, 4), sticky="w")
+
+        self._v4_summary_var = ctk.StringVar(value="")
+        ctk.CTkLabel(f, textvariable=self._v4_summary_var, anchor="w", justify="left",
+                     font=ctk.CTkFont(family="Courier", size=10)).grid(
+            row=6, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
+        )
+        return f
+
     # ══════════════════════════════════════════════════════════════════════════
     # State machine
     # ══════════════════════════════════════════════════════════════════════════
@@ -451,6 +634,8 @@ class SensitivityWindow(ctk.CTk):
 
     def _apply_visibility(self) -> None:
         s = self._state
+        v4_states = (V4_CONFIG, V4_CALIBRATING, V4_CALIBRATION_DONE,
+                     V4_COLLECTING, V4_PAUSED, V4_COMPLETE)
         visible = {
             self._com_section:           s == STARTUP,
             self._arduino_section:       s >= BASELINE,
@@ -460,7 +645,8 @@ class SensitivityWindow(ctk.CTk):
             self._ceiling_section:       s == CEILING_RAMP,
             self._force_section:         s in (FORCE_ENTRY, GRID_RUNNING),
             self._grid_progress_section: s in (GRID_RUNNING, PAUSED),
-            self._session_controls:      s in (GRID_RUNNING, PAUSED),
+            self._v4_section:            s == BASELINE or s in v4_states,
+            self._session_controls:      s in (GRID_RUNNING, PAUSED) or s in (V4_CALIBRATING, V4_COLLECTING, V4_PAUSED),
         }
         for w in self._rp_sections:
             w.pack_forget()
@@ -469,11 +655,22 @@ class SensitivityWindow(ctk.CTk):
                 w.pack(fill="x", padx=6, pady=3)
 
         if hasattr(self, '_pause_btn'):
-            self._pause_btn.configure( state="normal"   if s == GRID_RUNNING           else "disabled")
-            self._resume_btn.configure(state="normal"   if s == PAUSED                 else "disabled")
-            self._abort_btn.configure( state="normal"   if s in (GRID_RUNNING, PAUSED) else "disabled")
+            self._pause_btn.configure( state="normal"   if s in (GRID_RUNNING, V4_CALIBRATING, V4_COLLECTING) else "disabled")
+            self._resume_btn.configure(state="normal"   if s in (PAUSED, V4_PAUSED)                   else "disabled")
+            self._abort_btn.configure( state="normal"   if s in (GRID_RUNNING, PAUSED)                else "disabled")
         if hasattr(self, '_start_grid_btn'):
             self._start_grid_btn.configure(state="normal" if s == FORCE_ENTRY else "disabled")
+        if hasattr(self, '_ramp_back_btn'):
+            self._ramp_back_btn.configure(
+                state="normal" if s == CEILING_RAMP and self._ramp_bin_idx == 0 else "disabled"
+            )
+        if hasattr(self, '_v4_calib_btn'):
+            self._v4_calib_btn.configure(state="normal" if s in (BASELINE, V4_CONFIG) else "disabled")
+            self._v4_load_btn.configure(state="normal" if s in (BASELINE, V4_CONFIG) else "disabled")
+            self._v4_run_btn.configure(
+                state="normal" if s in (BASELINE, V4_CONFIG, V4_CALIBRATION_DONE) and self._v4_calibration_ready()
+                else "disabled"
+            )
 
     # ══════════════════════════════════════════════════════════════════════════
     # Feed
@@ -524,11 +721,12 @@ class SensitivityWindow(ctk.CTk):
         self._com_status_lbl.configure(text="Opening ports…")
         ender_port   = self._ender_port_var.get()
         arduino_port = self._arduino_port_var.get()
+        scale_port   = self._scale_port_var.get()
         threading.Thread(
-            target=self._connect_thread, args=(ender_port, arduino_port), daemon=True
+            target=self._connect_thread, args=(ender_port, arduino_port, scale_port), daemon=True
         ).start()
 
-    def _connect_thread(self, ender_port: str, arduino_port: str) -> None:
+    def _connect_thread(self, ender_port: str, arduino_port: str, scale_port: str) -> None:
         errors: list[str] = []
 
         ctrl = Ender3V2Controller(ender_port, baudrate=115200, response_queue=self._ender_resp_q)
@@ -550,7 +748,47 @@ class SensitivityWindow(ctk.CTk):
             errors.append(f"Arduino: {e}")
             self._ender_resp_q.put(("arduino_fail", str(e)))
 
+        try:
+            scale = serial.Serial(scale_port, _SCALE_BAUD, timeout=1)
+            time.sleep(1)
+            scale.reset_input_buffer()
+            self._scale_arduino = scale
+            self._scale_connected = True
+            with self._scale_lock:
+                self._scale_buffer.clear()
+            threading.Thread(target=self._scale_reader_thread, args=(scale,), daemon=True).start()
+            self._ender_resp_q.put(("scale_ok", scale_port))
+        except serial.SerialException as e:
+            errors.append(f"Load cell: {e}")
+            self._ender_resp_q.put(("scale_fail", str(e)))
+
         self._ender_resp_q.put(("connect_result", errors))
+
+    # ── Load-cell reader thread ───────────────────────────────────────────────
+
+    def _scale_reader_thread(self, ser: serial.Serial) -> None:
+        """Continuously drains the HX711 Arduino's streamed
+        'Load_cell output val: <float>' lines into a timestamped ring buffer.
+        Runs at whatever rate the device streams (~80 Hz, unconfirmed) — no
+        attempt is made to throttle it to the camera's 30 fps; samples are
+        instead correlated by wall-clock timestamp downstream
+        (_sample_scale_latest / _sample_scale_window)."""
+        while ser.is_open:
+            try:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+            except serial.SerialException:
+                break
+            if not line:
+                continue
+            m = re.search(r"[-+]?\d*\.?\d+", line)
+            if not m:
+                continue
+            try:
+                grams = float(m.group(0))
+            except ValueError:
+                continue
+            with self._scale_lock:
+                self._scale_buffer.append((time.time(), grams))
 
     # ── Ender worker thread ───────────────────────────────────────────────────
 
@@ -601,6 +839,10 @@ class SensitivityWindow(ctk.CTk):
                     pass
                 elif msg_type == "arduino_fail":
                     self._com_status_lbl.configure(text=f"Arduino: {data}")
+                elif msg_type == "scale_ok":
+                    pass
+                elif msg_type == "scale_fail":
+                    self._com_status_lbl.configure(text=f"Load cell: {data}")
                 elif msg_type == "connect_result":
                     errors: list[str] = data
                     if errors:
@@ -644,6 +886,10 @@ class SensitivityWindow(ctk.CTk):
             self._arduino.close()
             self._arduino = None
             self._arduino_connected = False
+        if self._scale_arduino and self._scale_arduino.is_open:
+            self._scale_arduino.close()
+            self._scale_arduino = None
+            self._scale_connected = False
         self._connect_btn.configure(text="Connect", state="normal", command=self._on_connect)
         self._com_status_lbl.configure(text="Disconnected")
 
@@ -708,6 +954,16 @@ class SensitivityWindow(ctk.CTk):
             self._current_bin_idx = self._resume_checkpoint["last_completed_bin"]
             self._last_completed_bin_id = self._resume_checkpoint["last_completed_bin"]
             self._launch_grid()
+        elif self._v4_resume_checkpoint:
+            self._resume_v4_session()
+        elif self._v4_enabled_var.get():
+            # Operator opted into the v4 protocol — stay in BASELINE/V4_CONFIG
+            # so the "Sensitivity v4" controls (Calibration / Run Sensitivity /
+            # Load Calibration) drive the flow instead of the v3 ceiling ramp.
+            self._set_state(V4_CONFIG)
+            self._status_var.set(
+                "STATE: V4_CONFIG — set Blend ID / params, then Calibration or Load Calibration"
+            )
         else:
             self._ramp_bin_idx = 0
             self._begin_ceiling_ramp()
@@ -784,6 +1040,25 @@ class SensitivityWindow(ctk.CTk):
         self._bin_force_levels[bin_id] = self._compute_force_levels()
         self._populate_force_display()
         self._set_state(FORCE_ENTRY)
+
+    def _on_ramp_back_to_baseline(self) -> None:
+        """Recover from accidentally entering the v3 ceiling ramp (e.g.
+        forgetting to check 'Use v4 protocol' before Capture Baseline). Only
+        reachable at ramp 1 before any bin has been confirmed — retracts the
+        indenter to clearance (same justification as _begin_ceiling_ramp's
+        opening retract, ui/sensitivity_window.py:1064-1067) and returns to
+        BASELINE so the operator can flip the checkbox and recapture."""
+        self._ender_sync_cmd("G90", timeout=10.0)
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=10.0)
+        self._ender_sync_cmd("M400")
+        self._ender_z = _CLEARANCE_Z_MM
+        self._update_ender_pos_display()
+        self._ramp_bin_idx = 0
+        self._ramp_var.set("Ramp:  — / 9")
+        self._set_state(BASELINE)
+        self._status_var.set(
+            "STATE: BASELINE — check 'Use v4 protocol' if needed, then Capture Baseline"
+        )
 
     def _compute_force_levels(self) -> list[tuple[str, float, float]]:
         levels = []
@@ -1105,12 +1380,31 @@ class SensitivityWindow(ctk.CTk):
 
     def _on_pause(self) -> None:
         self._pause_event.set()
-        self._set_state(PAUSED)
-        self._status_var.set("STATE: PAUSED — finishing current window, then stopped")
+        if self._state in (V4_CALIBRATING, V4_COLLECTING):
+            self._set_state(V4_PAUSED)
+            self._status_var.set("STATE: V4_PAUSED — finishing current step, then paused")
+        else:
+            self._set_state(PAUSED)
+            self._status_var.set("STATE: PAUSED — finishing current window, then stopped")
 
     def _on_resume(self) -> None:
-        # Re-assert absolute mode before resuming grid
+        # Re-assert absolute mode before resuming grid / v4 loops
         self._ender_sync_cmd("G90", timeout=10.0)
+
+        if self._state == V4_PAUSED:
+            self._pause_event.clear()
+            self._stop_event.clear()
+            if self._v4_phase == "calibration":
+                self._set_state(V4_CALIBRATING)
+                self._status_var.set("STATE: V4_CALIBRATING — resumed")
+                self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
+            else:
+                self._set_state(V4_COLLECTING)
+                self._status_var.set("STATE: V4_COLLECTING — resumed")
+                self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
+            self._v4_thread.start()
+            return
+
         self._skip_bin_entry = (self._current_rep > 1 or self._current_level_idx > 0)
         self._pause_event.clear()
         self._stop_event.clear()
@@ -1177,10 +1471,16 @@ class SensitivityWindow(ctk.CTk):
                 pass
         self._stop_event.set()
         self._pause_event.set()
-        self._set_state(PAUSED)
-        self._status_var.set(
-            "STATE: PAUSED — E-STOP sent. Fix issue, then Resume (G90 re-sent on resume)."
-        )
+        if self._state in (V4_CALIBRATING, V4_COLLECTING):
+            self._set_state(V4_PAUSED)
+            self._status_var.set(
+                "STATE: V4_PAUSED — E-STOP sent. Fix issue, then Resume (G90 re-sent on resume)."
+            )
+        else:
+            self._set_state(PAUSED)
+            self._status_var.set(
+                "STATE: PAUSED — E-STOP sent. Fix issue, then Resume (G90 re-sent on resume)."
+            )
 
     def _on_ender_reset(self) -> None:
         if not self._ender_connected:
@@ -1243,6 +1543,762 @@ class SensitivityWindow(ctk.CTk):
             self._status_var.set(
                 f"STATE: STARTUP — will resume session {ts} from bin {last + 1}"
             )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — small helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _sanitize_blend_id(self, raw: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw.strip())
+        return cleaned.strip("_")[:40]
+
+    def _ask_yes_no_blocking(self, title: str, message: str) -> bool:
+        """Show a yes/no dialog from a background thread and block until answered."""
+        result: dict[str, bool] = {}
+        done = threading.Event()
+
+        def _ask() -> None:
+            result["value"] = messagebox.askyesno(title, message)
+            done.set()
+
+        self.after(0, _ask)
+        done.wait()
+        return result.get("value", False)
+
+    def _update_v4_progress(self, text: str) -> None:
+        self.after(0, lambda: self._v4_progress_var.set(text))
+
+    def _set_v4_progress_fraction(self, frac: float) -> None:
+        self.after(0, lambda: self._v4_progress_bar.set(max(0.0, min(1.0, frac))))
+
+    def _v4_calibration_ready(self) -> bool:
+        return len(self._v4_z_thresh_map) == len(GRID_7X5)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — frame capture / drift gate (shared by both phases)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _capture_n_frames(self, n: int, timeout_s: float = 15.0) -> list[tuple[list[MarkerRecord], float]]:
+        """Reuses the same _frame_buffer/_recording_active/_frame_lock mechanism
+        as the v3 grid loop's _record_window — avoids racing _frame_loop's reads."""
+        with self._frame_lock:
+            self._frame_buffer.clear()
+        self._recording_active.set()
+        deadline = time.time() + timeout_s
+        while True:
+            with self._frame_lock:
+                count = len(self._frame_buffer)
+            if count >= n or self._stop_event.is_set() or time.time() > deadline:
+                break
+            time.sleep(0.005)
+        self._recording_active.clear()
+        with self._frame_lock:
+            return list(self._frame_buffer[:n])
+
+    def _capture_tracked_count(self, n_frames: int = 3) -> int:
+        frames = self._capture_n_frames(n_frames, timeout_s=10.0)
+        if not frames:
+            return 0
+        counts = [sum(1 for r in records if not r.autofilled) for records, _ in frames]
+        return round(sum(counts) / len(counts))
+
+    def _check_baseline_drift(self, bin_id: int) -> bool:
+        """Capture 5 frames, compare mean per-marker centroid drift (px) against
+        DRIFT_GATE_PX. Returns True to continue, False if the operator chose to abort."""
+        frames = self._capture_n_frames(5, timeout_s=10.0)
+        if not frames:
+            return True
+        per_frame_means = []
+        for records, _ in frames:
+            mags = [r.magnitude for r in records if not r.autofilled]
+            if mags:
+                per_frame_means.append(sum(mags) / len(mags))
+        if not per_frame_means:
+            return True
+        mean_drift = sum(per_frame_means) / len(per_frame_means)
+        if mean_drift <= DRIFT_GATE_PX:
+            return True
+        return self._ask_yes_no_blocking(
+            "Baseline Drift Detected",
+            f"Mean marker drift at bin {bin_id} is {mean_drift:.2f} px "
+            f"(limit {DRIFT_GATE_PX:.1f} px).\nCheck slab seating.\n\n"
+            f"Continue this session, or Abort?"
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — Arduino force telemetry
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _sample_scale_latest(self, window_s: float = _SCALE_SAMPLE_WINDOW_S) -> float:
+        """Mean of buffered load-cell readings from the last `window_s` seconds —
+        a single-point sample (e.g. F_max at the ramp's stopping step) smoothed
+        against sensor noise. NaN if not connected or nothing buffered yet."""
+        if not self._scale_connected:
+            return float("nan")
+        cutoff = time.time() - window_s
+        with self._scale_lock:
+            readings = [g for ts, g in self._scale_buffer if ts >= cutoff]
+        if not readings:
+            return float("nan")
+        return sum(readings) / len(readings)
+
+    def _sample_scale_window(self, start_ts: float, end_ts: float) -> float:
+        """Mean of every buffered load-cell reading whose timestamp falls inside
+        [start_ts, end_ts] — the wall-clock span actually covered by a press
+        hold. Correlating by timestamp (rather than matching sample-for-sample)
+        is what reconciles the load cell's ~80 Hz stream with the camera's
+        30 fps capture: each side free-runs at its own rate and the two are
+        aligned after the fact by when they happened, not how many samples they
+        produced. NaN if not connected or nothing buffered in that span."""
+        if not self._scale_connected:
+            return float("nan")
+        with self._scale_lock:
+            readings = [g for ts, g in self._scale_buffer if start_ts <= ts <= end_ts]
+        if not readings:
+            return float("nan")
+        return sum(readings) / len(readings)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — checkpointing
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _write_z_thresh_map_checkpoint(self, complete: bool) -> None:
+        self._v4_z_thresh_map_path = write_z_thresh_map(
+            self._session_dir, self._v4_blend_id, float(self._v4_z_step_var.get()),
+            self._v4_z_thresh_map, complete,
+        )
+
+    def _save_v4_checkpoint(self) -> None:
+        if not self._session_dir:
+            return
+        self._checkpoint_v4.save(
+            session_dir=self._session_dir,
+            session_ts=self._session_ts,
+            blend_id=self._v4_blend_id,
+            phase=self._v4_phase,
+            z_thresh_map_path=self._v4_z_thresh_map_path,
+            completed_calibration_bins=sorted(self._v4_z_thresh_map.keys()),
+            completed_collection_reps={
+                str(bid): sorted(reps) for bid, reps in self._v4_completed_reps.items()
+            },
+            csv_path=self._writer_v4.csv_path if self._writer_v4 else "",
+            summary_csv_path=self._v4_summary_csv_path,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — COM health
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _check_com_alive(self) -> bool:
+        ender_ok = bool(self._ender_controller and self._ender_controller.ser
+                        and self._ender_controller.ser.is_open)
+        if not ender_ok:
+            self._handle_com_disconnect("Ender")
+            return False
+        arduino_ok = bool(self._arduino and self._arduino.is_open)
+        if not arduino_ok:
+            self._handle_com_disconnect("Arduino")
+            return False
+        return True
+
+    def _handle_com_disconnect(self, device: str) -> None:
+        self._stop_event.set()
+        self._pause_event.set()
+        self.after(0, lambda: self._set_state(V4_PAUSED))
+        self.after(0, lambda: self._status_var.set(
+            f"STATE: V4_PAUSED — {device} disconnected. Reconnect, then Resume."
+        ))
+        self.after(0, lambda: messagebox.showerror(
+            "Connection Lost",
+            f"{device} disconnected during the v4 session.\n"
+            f"Reconnect it and click Resume to continue from the last checkpoint."
+        ))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — button handlers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_v4_calibration(self) -> None:
+        if not self._check_com_alive():
+            messagebox.showerror("Not Connected", "Connect the Ender and Arduino before starting calibration.")
+            return
+        blend_id = self._sanitize_blend_id(self._v4_blend_id_var.get())
+        if not blend_id:
+            messagebox.showerror("Input Error", "Enter a Blend ID before starting calibration.")
+            return
+        if not messagebox.askyesno(
+            "Start Calibration",
+            "This will execute automated ceiling ramps at all 35 bins.\n"
+            "Ensure the slab is mounted and the baseline is stable.\n\nProceed?"
+        ):
+            return
+        self._v4_blend_id = blend_id
+        self._launch_v4_calibration()
+
+    def _on_v4_run_sensitivity(self) -> None:
+        if not self._check_com_alive():
+            messagebox.showerror("Not Connected", "Connect the Ender and Arduino before starting collection.")
+            return
+        if not self._v4_calibration_ready():
+            messagebox.showerror("Calibration Required", "Run or load a calibration before starting collection.")
+            return
+        blend_id = self._sanitize_blend_id(self._v4_blend_id_var.get()) or self._v4_blend_id
+        if not blend_id:
+            messagebox.showerror("Input Error", "Enter a Blend ID before starting collection.")
+            return
+        self._v4_blend_id = blend_id
+        self._launch_v4_collection()
+
+    def _on_v4_load_calibration(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Load z_thresh_map.json",
+            initialdir=os.path.join("output", "sessions"),
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        data = load_z_thresh_map(path)
+        if data is None or len(data.get("bins", {})) != len(GRID_7X5):
+            messagebox.showerror(
+                "Load Failed",
+                f"'{os.path.basename(path)}' is not a valid/complete z_thresh_map "
+                f"(expected {len(GRID_7X5)} bins)."
+            )
+            return
+        self._v4_z_thresh_map = data["bins"]
+        self._v4_z_thresh_map_path = path
+        if data.get("blend_id"):
+            self._v4_blend_id = data["blend_id"]
+            self._v4_blend_id_var.set(data["blend_id"])
+        self._set_state(V4_CALIBRATION_DONE)
+        self._populate_v4_calibration_summary()
+        self._status_var.set(f"STATE: V4_CALIBRATION_DONE — loaded {os.path.basename(path)}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — launch / resume
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _launch_v4_calibration(self) -> None:
+        self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_dir = os.path.join("output", "sessions",
+                                          f"{self._session_ts}_{self._v4_blend_id}_sensitivity")
+        os.makedirs(self._session_dir, exist_ok=True)
+        write_marker_baselines(self._session_dir, self._session_ts,
+                               self._tracker.baseline_positions_mm)
+
+        self._v4_z_thresh_map = {}
+        self._v4_skipped_bins = set()
+        self._v4_completed_reps = {}
+        self._v4_phase = "calibration"
+        self._session_start_t = time.time()
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self._ender_sync_cmd("G90", timeout=10.0)
+
+        self._set_state(V4_CALIBRATING)
+        self._status_var.set("STATE: V4_CALIBRATING — automated ceiling ramp in progress")
+        self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
+        self._v4_thread.start()
+
+    def _launch_v4_collection(self) -> None:
+        if not self._session_dir:
+            self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._session_dir = os.path.join("output", "sessions",
+                                              f"{self._session_ts}_{self._v4_blend_id}_sensitivity")
+            os.makedirs(self._session_dir, exist_ok=True)
+            write_marker_baselines(self._session_dir, self._session_ts,
+                                   self._tracker.baseline_positions_mm)
+        if self._writer_v4 is None:
+            self._writer_v4 = SensitivityWriterV4(self._session_dir)
+
+        self._v4_phase = "collection"
+        self._session_start_t = time.time()
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self._ender_sync_cmd("G90", timeout=10.0)
+
+        self._set_state(V4_COLLECTING)
+        self._status_var.set("STATE: V4_COLLECTING — single-press / N-rep collection in progress")
+        self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
+        self._v4_thread.start()
+
+    def _load_resume_z_thresh_map(self, cp: dict) -> None:
+        path = cp.get("z_thresh_map_path", "")
+        data = load_z_thresh_map(path) if path else None
+        if data is not None:
+            self._v4_z_thresh_map = data["bins"]
+            self._v4_z_thresh_map_path = path
+        else:
+            self._v4_z_thresh_map = {}
+            self._v4_z_thresh_map_path = ""
+
+    def _resume_v4_session(self) -> None:
+        cp = self._v4_resume_checkpoint
+        if cp is None:
+            return
+        self._session_dir = cp["session_dir"]
+        self._session_ts  = cp.get("session_ts", "")
+        self._v4_blend_id = cp.get("blend_id", "")
+        self._v4_blend_id_var.set(self._v4_blend_id)
+        self._v4_phase    = cp.get("phase", "calibration")
+        self._v4_summary_csv_path = cp.get("summary_csv_path", "")
+        self._load_resume_z_thresh_map(cp)
+        self._v4_completed_reps = {
+            int(bid): set(reps) for bid, reps in cp.get("completed_collection_reps", {}).items()
+        }
+        self._v4_resume_checkpoint = None
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self._ender_sync_cmd("G90", timeout=10.0)
+
+        if self._v4_phase == "calibration":
+            self._set_state(V4_CALIBRATING)
+            self._status_var.set(
+                f"STATE: V4_CALIBRATING — resumed; {len(self._v4_z_thresh_map)}/{len(GRID_7X5)} bins done"
+            )
+            self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
+        else:
+            csv_path = cp.get("csv_path", "")
+            self._writer_v4 = SensitivityWriterV4(self._session_dir, csv_path=csv_path or None)
+            self._set_state(V4_COLLECTING)
+            self._status_var.set("STATE: V4_COLLECTING — resumed from checkpoint")
+            self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
+        self._v4_thread.start()
+
+    def _check_for_v4_resume(self) -> None:
+        cp = self._checkpoint_v4.scan_for_resume()
+        if cp is None:
+            return
+        ts    = cp.get("session_ts", "unknown")
+        phase = cp.get("phase", "unknown")
+        blend = cp.get("blend_id", "")
+        if messagebox.askyesno(
+            "Resume v4 Session",
+            f"Incomplete v4 session found:\n  Timestamp: {ts}\n  Blend ID: {blend}\n"
+            f"  Phase: {phase}\n\nResume this session?",
+        ):
+            self._v4_resume_checkpoint = cp
+            self._status_var.set(f"STATE: STARTUP — will resume v4 session {ts} ({phase} phase)")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — Phase 1: automated per-bin ceiling ramp (background thread)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _v4_calibration_loop(self) -> None:
+        bins = GRID_7X5
+        total = len(bins)
+        z_step = abs(float(self._v4_z_step_var.get()))
+
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+        self._ender_sync_cmd("M400")
+        self._ender_z = _CLEARANCE_Z_MM
+        self.after(0, self._update_ender_pos_display)
+
+        for idx, b in enumerate(bins):
+            if self._pause_event.is_set() or self._stop_event.is_set():
+                break
+            bin_id, x_mm, y_mm = b["bin_id"], b["x_mm"], b["y_mm"]
+            if bin_id in self._v4_z_thresh_map:
+                continue
+            if not self._check_com_alive():
+                return
+
+            self._update_v4_progress(f"Calibration — bin {bin_id}/{total}  (X {x_mm:.3f}, Y {y_mm:.3f})")
+            self._set_v4_progress_fraction(idx / total)
+
+            self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000")
+            self._ender_sync_cmd("M400")
+            self._ender_x, self._ender_y = x_mm, y_mm
+            self.after(0, self._update_ender_pos_display)
+
+            if not self._check_baseline_drift(bin_id):
+                self._stop_event.set()
+                self._pause_event.set()
+                self.after(0, lambda: self._set_state(V4_PAUSED))
+                self.after(0, lambda: self._status_var.set(
+                    "STATE: V4_PAUSED — calibration aborted by operator (drift gate)"
+                ))
+                return
+
+            # Descend to the contact-height reference (Z=0) before ramping
+            self._ender_sync_cmd("G1 Z0.000 F300", timeout=10.0)
+            self._ender_sync_cmd("M400")
+            self._ender_z = 0.0
+            self.after(0, self._update_ender_pos_display)
+
+            n_baseline = self._capture_tracked_count(3)
+            z_current = 0.0
+            hit_hard_limit = False
+            while True:
+                if self._pause_event.is_set() or self._stop_event.is_set():
+                    break
+                self._ender_sync_cmd("G91")
+                self._ender_sync_cmd(f"G1 Z-{z_step:.3f} F100")
+                self._ender_sync_cmd("M400")
+                self._ender_sync_cmd("G90")
+                z_current += z_step
+                self._ender_z = -z_current
+                self.after(0, self._update_ender_pos_display)
+
+                n_current = self._capture_tracked_count(3)
+                if n_current < n_baseline:
+                    break
+                if z_current > Z_HARD_LIMIT_MM:
+                    hit_hard_limit = True
+                    break
+
+            if self._pause_event.is_set() or self._stop_event.is_set():
+                self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+                self._ender_z = _CLEARANCE_Z_MM
+                self.after(0, self._update_ender_pos_display)
+                break
+
+            if hit_hard_limit:
+                self.after(0, lambda _b=bin_id: messagebox.showwarning(
+                    "Z Hard Limit Reached",
+                    f"Bin {_b}: descended past {Z_HARD_LIMIT_MM:.1f} mm without losing a "
+                    f"marker. Skipping this bin — investigate manually."
+                ))
+                self._v4_skipped_bins.add(bin_id)
+                self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+                self._ender_sync_cmd("M400")
+                self._ender_z = _CLEARANCE_Z_MM
+                self.after(0, self._update_ender_pos_display)
+                continue
+
+            z_max_mm = -z_current
+            z_thresh_mm = 0.90 * z_max_mm
+
+            f_max_g = self._sample_scale_latest()
+            if np.isnan(f_max_g):
+                f_max_n: Optional[float] = None
+                f_thresh_n: Optional[float] = None
+            else:
+                f_max_n = (f_max_g / 1000.0) * _GRAVITY_MPS2
+                f_thresh_n = 0.90 * f_max_n
+
+            # Retract past the Z=0 contact reference before travelling to the next bin
+            self._ender_sync_cmd(f"G1 Z{_RAMP_RETRACT_MM:.3f} F300", timeout=10.0)
+            self._ender_sync_cmd("M400")
+            self._ender_z = _RAMP_RETRACT_MM
+            self.after(0, self._update_ender_pos_display)
+
+            self._v4_z_thresh_map[bin_id] = {
+                "x_mm": round(x_mm, 3), "y_mm": round(y_mm, 3),
+                "z_max_mm": round(z_max_mm, 4), "z_thresh_mm": round(z_thresh_mm, 4),
+                "f_max_n": round(f_max_n, 4) if f_max_n is not None else None,
+                "f_thresh_n": round(f_thresh_n, 4) if f_thresh_n is not None else None,
+            }
+            self._write_z_thresh_map_checkpoint(complete=False)
+            self._save_v4_checkpoint()
+
+        if not self._pause_event.is_set() and not self._stop_event.is_set():
+            self._write_z_thresh_map_checkpoint(complete=True)
+            self._v4_phase = "collection"
+            self._save_v4_checkpoint()
+            self.after(0, self._on_calibration_complete)
+
+    def _on_calibration_complete(self) -> None:
+        self._set_state(V4_CALIBRATION_DONE)
+        self._update_v4_progress(f"Calibration complete — {len(self._v4_z_thresh_map)}/{len(GRID_7X5)} bins")
+        self._set_v4_progress_fraction(1.0)
+        self._populate_v4_calibration_summary()
+        self._status_var.set("STATE: V4_CALIBRATION_DONE — Run Sensitivity to begin collection")
+
+    def _populate_v4_calibration_summary(self) -> None:
+        bins = self._v4_z_thresh_map
+        if not bins:
+            self._v4_summary_var.set("")
+            return
+        z_threshes = [v["z_thresh_mm"] for v in bins.values() if v.get("z_thresh_mm") is not None]
+        f_threshes = [v["f_thresh_n"] for v in bins.values() if v.get("f_thresh_n") is not None]
+        lines = [f"Calibration: {len(bins)}/{len(GRID_7X5)} bins"]
+        if z_threshes:
+            lines.append(f"Z_thresh: mean {sum(z_threshes) / len(z_threshes):.3f} mm   "
+                         f"range [{min(z_threshes):.3f}, {max(z_threshes):.3f}]")
+        if f_threshes:
+            lines.append(f"F_thresh: mean {sum(f_threshes) / len(f_threshes):.4f} N   "
+                         f"range [{min(f_threshes):.4f}, {max(f_threshes):.4f}]")
+        if self._v4_skipped_bins:
+            lines.append(f"Skipped bins: {sorted(self._v4_skipped_bins)}")
+        self._v4_summary_var.set("\n".join(lines))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — Phase 2: single-press x N-rep collection (background thread)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _v4_collection_loop(self) -> None:
+        bins = [b for b in GRID_7X5 if b["bin_id"] in self._v4_z_thresh_map]
+        total = len(bins)
+        n_reps = max(1, int(self._v4_n_reps_var.get()))
+        z_retract = abs(float(self._v4_z_retract_var.get()))
+
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+        self._ender_sync_cmd("M400")
+        self._ender_z = _CLEARANCE_Z_MM
+        self.after(0, self._update_ender_pos_display)
+
+        for idx, b in enumerate(bins):
+            if self._pause_event.is_set() or self._stop_event.is_set():
+                break
+            bin_id, x_mm, y_mm = b["bin_id"], b["x_mm"], b["y_mm"]
+            entry = self._v4_z_thresh_map[bin_id]
+            z_thresh_mm: float = entry["z_thresh_mm"]
+            f_thresh_n: float = entry["f_thresh_n"] if entry.get("f_thresh_n") is not None else float("nan")
+
+            done_reps = self._v4_completed_reps.setdefault(bin_id, set())
+            if bin_id in self._v4_skipped_bins or len(done_reps) >= n_reps:
+                continue
+            if not self._check_com_alive():
+                return
+
+            self._update_v4_progress(f"Collection — bin {bin_id}/{total}, rep {len(done_reps) + 1}/{n_reps}")
+            self._set_v4_progress_fraction(idx / total)
+
+            self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000")
+            self._ender_sync_cmd("M400")
+            self._ender_x, self._ender_y = x_mm, y_mm
+            self.after(0, self._update_ender_pos_display)
+
+            if not self._check_baseline_drift(bin_id):
+                self._stop_event.set()
+                self._pause_event.set()
+                self.after(0, lambda: self._set_state(V4_PAUSED))
+                self.after(0, lambda: self._status_var.set(
+                    "STATE: V4_PAUSED — collection aborted by operator (drift gate)"
+                ))
+                return
+
+            n_baseline = self._capture_tracked_count(3)
+            consecutive_failures = 0
+
+            for rep in range(1, n_reps + 1):
+                if self._pause_event.is_set() or self._stop_event.is_set():
+                    break
+                if rep in done_reps:
+                    continue
+
+                self._update_v4_progress(f"Collection — bin {bin_id}/{total}, rep {rep}/{n_reps}")
+
+                # Press to Z_thresh — absolute move from the G92 contact reference (Z=0)
+                self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F300")
+                self._ender_sync_cmd("M400")
+                self._ender_z = z_thresh_mm
+                self.after(0, self._update_ender_pos_display)
+                time.sleep(_Z_SETTLE_S)
+                if self._stop_event.is_set():
+                    break
+
+                mid_loss = False
+                with self._frame_lock:
+                    self._frame_buffer.clear()
+                hold_start_ts = time.time()
+                self._recording_active.set()
+                deadline = time.time() + 15.0
+                while True:
+                    with self._frame_lock:
+                        n = len(self._frame_buffer)
+                        last = self._frame_buffer[-1][0] if self._frame_buffer else None
+                    if last is not None and sum(1 for r in last if not r.autofilled) < n_baseline - 1:
+                        mid_loss = True
+                        break
+                    if n >= 30 or self._stop_event.is_set() or time.time() > deadline:
+                        break
+                    time.sleep(0.005)
+                self._recording_active.clear()
+                hold_end_ts = time.time()
+                if self._stop_event.is_set():
+                    break
+
+                # Retract past contact reference + configured clearance — same
+                # absolute target whether the press completed or lost tracking
+                self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F300")
+                self._ender_sync_cmd("M400")
+                self._ender_z = z_retract
+                self.after(0, self._update_ender_pos_display)
+
+                if mid_loss:
+                    consecutive_failures += 1
+                    self._update_v4_progress(
+                        f"Bin {bin_id} rep {rep}: tracking loss mid-press — aborting rep "
+                        f"({consecutive_failures}/{_TRACKING_LOSS_STRIKES})"
+                    )
+                    time.sleep(0.5)
+                    if consecutive_failures >= _TRACKING_LOSS_STRIKES:
+                        self._v4_skipped_bins.add(bin_id)
+                        self.after(0, lambda _b=bin_id: messagebox.showwarning(
+                            "Bin Skipped",
+                            f"Bin {_b}: {_TRACKING_LOSS_STRIKES} consecutive reps failed due "
+                            f"to tracking loss — skipping (flagged in sensitivity_summary.csv)."
+                        ))
+                        break
+                    continue
+
+                consecutive_failures = 0
+                with self._frame_lock:
+                    frames = list(self._frame_buffer[:30])
+
+                f_actual_g = self._sample_scale_window(hold_start_ts, hold_end_ts)
+                f_actual_n = (f_actual_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_actual_g) else float("nan")
+
+                if self._writer_v4:
+                    for frame_idx, (records, ts) in enumerate(frames):
+                        self._writer_v4.buffer_frame(
+                            records, frame_idx, ts,
+                            bin_id, x_mm, y_mm, rep,
+                            z_thresh_mm, f_thresh_n, f_actual_n,
+                        )
+                    self._writer_v4.flush_bin()
+
+                time.sleep(0.5)
+                done_reps.add(rep)
+                self._save_v4_checkpoint()
+
+            if self._pause_event.is_set() or self._stop_event.is_set():
+                break
+
+        if not self._pause_event.is_set() and not self._stop_event.is_set():
+            self._v4_phase = "complete"
+            self._save_v4_checkpoint()
+            self.after(0, self._on_collection_complete)
+
+    def _on_collection_complete(self) -> None:
+        rows = self._compute_v4_metrics()
+        self._v4_summary_csv_path = write_sensitivity_summary(self._session_dir, self._v4_blend_id, rows)
+        if self._writer_v4:
+            self._writer_v4.close()
+            self._writer_v4 = None
+        g = self._compute_global_metrics(rows)
+        self._generate_v4_figures(rows)
+
+        self._set_state(V4_COMPLETE)
+        self._update_v4_progress(f"Collection complete — {len(rows)}/{len(GRID_7X5)} bins")
+        self._set_v4_progress_fraction(1.0)
+        self._v4_summary_var.set(
+            f"U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm   "
+            f"S_mean = {g['S_mean']:.4f} mm/N   S_std = {g['S_std']:.4f} mm/N\n"
+            f"Skipped bins: {sorted(self._v4_skipped_bins) if self._v4_skipped_bins else 'none'}"
+        )
+        self._status_var.set("STATE: V4_COMPLETE — sensitivity_summary.csv and figures saved")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v4 — post-collection metrics & figures
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _compute_v4_metrics(self) -> list[dict]:
+        df: Optional[pd.DataFrame] = None
+        if self._writer_v4 and os.path.exists(self._writer_v4.csv_path):
+            df = pd.read_csv(self._writer_v4.csv_path)
+
+        rows: list[dict] = []
+        for b in GRID_7X5:
+            bin_id = b["bin_id"]
+            entry = self._v4_z_thresh_map.get(bin_id)
+            bin_df = df[df["bin_id"] == bin_id] if df is not None else None
+            flagged = entry is None or bin_id in self._v4_skipped_bins or bin_df is None or bin_df.empty
+
+            if flagged:
+                rows.append({
+                    "bin_id": bin_id,
+                    "bin_x_mm": round(b["x_mm"], 3),
+                    "bin_y_mm": round(b["y_mm"], 3),
+                    "n_markers": 0,
+                    "z_thresh_mm": entry["z_thresh_mm"] if entry else float("nan"),
+                    "f_thresh_n": (entry.get("f_thresh_n") if entry and entry.get("f_thresh_n") is not None
+                                   else float("nan")),
+                    "d_bar_mean_mm": float("nan"),
+                    "d_bar_std_mm": float("nan"),
+                    "f_actual_mean_n": float("nan"),
+                    "S_scalar_mm_per_n": float("nan"),
+                    "rep_std_mm": float("nan"),
+                    "n_reps": 0,
+                })
+                continue
+
+            assert bin_df is not None and entry is not None
+            per_rep = bin_df.groupby("rep").agg(
+                d_bar=("magnitude_mm", "mean"),
+                f_actual=("f_actual_n", "mean"),
+            )
+            d_all = bin_df["magnitude_mm"].to_numpy(dtype=float)
+            d_bar_values = per_rep["d_bar"].to_numpy(dtype=float)
+            f_actual_mean = float(np.nanmean(per_rep["f_actual"].to_numpy(dtype=float)))
+            d_bar_mean = float(np.mean(d_all))
+            d_bar_std = float(np.std(d_all))
+            rep_std = float(np.std(d_bar_values))
+            s_scalar = (d_bar_mean / f_actual_mean) if f_actual_mean and not np.isnan(f_actual_mean) \
+                else float("nan")
+
+            rows.append({
+                "bin_id": bin_id,
+                "bin_x_mm": round(b["x_mm"], 3),
+                "bin_y_mm": round(b["y_mm"], 3),
+                "n_markers": int(bin_df["marker_id"].nunique()),
+                "z_thresh_mm": round(float(entry["z_thresh_mm"]), 4),
+                "f_thresh_n": (round(float(entry["f_thresh_n"]), 4) if entry.get("f_thresh_n") is not None
+                               else float("nan")),
+                "d_bar_mean_mm": round(d_bar_mean, 4),
+                "d_bar_std_mm": round(d_bar_std, 4),
+                "f_actual_mean_n": round(f_actual_mean, 4),
+                "S_scalar_mm_per_n": round(s_scalar, 6) if not np.isnan(s_scalar) else float("nan"),
+                "rep_std_mm": round(rep_std, 4),
+                "n_reps": int(len(per_rep)),
+            })
+        return rows
+
+    def _compute_global_metrics(self, rows: list[dict]) -> dict[str, float]:
+        s_vals = np.array([r["S_scalar_mm_per_n"] for r in rows], dtype=float)
+        s_vals = s_vals[~np.isnan(s_vals)]
+        rep_vals = np.array([r["rep_std_mm"] for r in rows], dtype=float)
+        rep_vals = rep_vals[~np.isnan(rep_vals)]
+
+        mu    = float(np.mean(s_vals)) if s_vals.size else float("nan")
+        sigma = float(np.std(s_vals))  if s_vals.size else float("nan")
+        u     = (1.0 / (1.0 + sigma / abs(mu))) if s_vals.size and mu != 0 else float("nan")
+        rep   = float(np.mean(rep_vals)) if rep_vals.size else float("nan")
+        return {"U": u, "Rep": rep, "S_mean": mu, "S_std": sigma}
+
+    def _generate_v4_figures(self, rows: list[dict]) -> None:
+        plt.style.use(["science", "no-latex"])
+        by_bin = {r["bin_id"]: r for r in rows}
+        suffix = f"_{self._v4_blend_id}" if self._v4_blend_id else ""
+
+        def _grid(key: str) -> np.ndarray:
+            arr = np.full((_GRID_7X5_ROWS, _GRID_7X5_COLS), np.nan)
+            for b in GRID_7X5:
+                r = by_bin.get(b["bin_id"])
+                if r is not None:
+                    arr[b["row"], b["col"]] = r[key]
+            return arr
+
+        for key, fname, cmap in (
+            ("S_scalar_mm_per_n", f"sensitivity_map{suffix}.png",   "viridis"),
+            ("z_thresh_mm",       f"z_thresh_map{suffix}.png",      "plasma"),
+            ("rep_std_mm",        f"repeatability_map{suffix}.png", "coolwarm"),
+        ):
+            fig, ax = plt.subplots()
+            im = ax.imshow(_grid(key), cmap=cmap)
+            ax.set_xlabel("Column")
+            ax.set_ylabel("Row")
+            ax.set_title(key)
+            fig.colorbar(im, ax=ax)
+            fig.savefig(os.path.join(self._session_dir, fname), dpi=200, bbox_inches="tight")
+            plt.close(fig)
+
+        bin_ids = [r["bin_id"] for r in rows]
+        s_vals  = [r["S_scalar_mm_per_n"] for r in rows]
+        s_stds  = [r["d_bar_std_mm"] for r in rows]
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.bar(bin_ids, s_vals, yerr=s_stds, capsize=2)
+        ax.set_xlabel("Bin ID")
+        ax.set_ylabel("S_scalar (mm/N)")
+        title = "Per-bin scalar sensitivity"
+        if self._v4_blend_id:
+            title += f" — {self._v4_blend_id}"
+        ax.set_title(title)
+        fig.savefig(os.path.join(self._session_dir, f"sensitivity_bar{suffix}.png"),
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Window close
