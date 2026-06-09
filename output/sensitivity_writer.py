@@ -205,6 +205,9 @@ SENSITIVITY_SUMMARY_COLUMNS = [
     "z_thresh_mm", "f_thresh_n",
     "d_bar_mean_mm", "d_bar_std_mm", "f_actual_mean_n",
     "S_scalar_mm_per_n", "rep_std_mm", "n_reps",
+    "n_markers_local",
+    "d_bar_local_mean_mm", "d_bar_local_std_mm",
+    "S_local_mm_per_n", "rep_std_local_mm",
 ]
 
 

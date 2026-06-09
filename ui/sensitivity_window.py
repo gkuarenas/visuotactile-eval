@@ -90,7 +90,8 @@ _GRID_7X5_WORK_H_MM = 27.2
 _GRID_7X5_Y_OFFSET_MM = -1.2
 _GRID_7X5_X_OFFSET_MM = 0.0
 
-DRIFT_GATE_PX     = 2.0   # max allowed mean per-marker centroid drift before a bin (px)
+_K_DEFAULT        = 4     # k nearest markers per bin for S_local (pure Euclidean, no footprint)
+DRIFT_GATE_PX     = 3.0   # max allowed mean per-marker centroid drift before a bin (px)
 Z_HARD_LIMIT_MM   = 10.0  # absolute descent depth limit during the ceiling ramp (mm)
 _RAMP_RETRACT_MM  = 1.0   # clearance retracted past the Z=0 contact reference after each ramp
 _TRACKING_LOSS_STRIKES = 3  # consecutive mid-press tracking-loss reps before a bin is skipped
@@ -232,6 +233,7 @@ class SensitivityWindow(ctk.CTk):
         self._scale_connected = False
         self._scale_buffer: deque[tuple[float, float]] = deque(maxlen=_SCALE_BUFFER_MAXLEN)
         self._scale_lock = threading.Lock()
+        self._scale_calib_q: queue.Queue[str] = queue.Queue()
 
         # Session parameters — per-bin ceiling-ramp calibration (one ramp per
         # grid position, since F_max differs by proximity to the rigid edges)
@@ -313,8 +315,10 @@ class SensitivityWindow(ctk.CTk):
         ).pack(fill="x", padx=8, pady=(6, 2))
 
         # Build all section frames (packed here in display order; _apply_visibility controls visibility)
-        self._com_section           = self._build_com_section(rp)
-        self._arduino_section       = self._build_arduino_section(rp)
+        self._com_section                = self._build_com_section(rp)
+        self._detection_params_section   = self._build_detection_params_section(rp)
+        self._scale_calibration_section  = self._build_scale_calibration_section(rp)
+        self._arduino_section            = self._build_arduino_section(rp)
         self._position_section      = self._build_position_section(rp)
         self._jog_section           = self._build_jog_section(rp)
         self._estop_bar             = self._build_estop_bar(rp)
@@ -327,6 +331,8 @@ class SensitivityWindow(ctk.CTk):
         # Ordered list used by _apply_visibility for deterministic pack order
         self._rp_sections = [
             self._com_section,
+            self._detection_params_section,
+            self._scale_calibration_section,
             self._arduino_section,
             self._position_section,
             self._jog_section,
@@ -338,8 +344,143 @@ class SensitivityWindow(ctk.CTk):
             self._session_controls,
         ]
         self._apply_visibility()
+        self.after(200, self._poll_scale_calib_q)
+        self.after(200, self._poll_v4_force_display)
 
     # ── Section builders ──────────────────────────────────────────────────────
+
+    def _add_slider(
+        self,
+        parent: ctk.CTkFrame,
+        label: str,
+        from_: float,
+        to: float,
+        default: float,
+        command,
+        col: int,
+        row: int = 0,
+        fmt: str = "{:.0f}",
+        slider_width: int = 140,
+    ) -> ctk.CTkSlider:
+        range_label = (
+            f"{label} ({from_:.0f}–{to:.0f}):"
+            if fmt == "{:.0f}"
+            else f"{label} ({from_:.1f}–{to:.1f}):"
+        )
+        ctk.CTkLabel(parent, text=range_label).grid(row=row, column=col, padx=(8, 2), sticky="e")
+        val_var = ctk.StringVar(value=fmt.format(default))
+        slider = ctk.CTkSlider(
+            parent, from_=from_, to=to, width=slider_width,
+            command=lambda v, vv=val_var, cb=command, f=fmt: (vv.set(f.format(v)), cb(v))
+        )
+        slider.set(default)
+        slider.grid(row=row, column=col + 1, padx=(0, 4))
+        ctk.CTkLabel(parent, textvariable=val_var, width=44, anchor="w").grid(
+            row=row, column=col + 2, padx=(0, 8)
+        )
+        return slider
+
+    def _build_detection_params_section(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent)
+        ctk.CTkLabel(f, text="Detection Params", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=3, padx=8, pady=(4, 2), sticky="w"
+        )
+        params = self._tracker.params
+        self._add_slider(f, "LoG ksize", 3, 101, params["log_ksize"],
+                         self._on_ksize_slider, col=0, row=1)
+        self._add_slider(f, "LoG sigma", 1.0, 30.0, params["log_sigma"],
+                         self._on_sigma_slider, col=0, row=2, fmt="{:.1f}")
+        self._add_slider(f, "Gate px", 20, 400, self._tracker.gate_px,
+                         self._on_gate_slider, col=0, row=3)
+        self._add_slider(f, "Threshold", 1, 255, params["thresh"],
+                         self._on_thresh_slider, col=0, row=4)
+        return f
+
+    def _on_ksize_slider(self, value: float) -> None:
+        self._tracker.params["log_ksize"] = int(value) | 1
+
+    def _on_sigma_slider(self, value: float) -> None:
+        self._tracker.params["log_sigma"] = float(value)
+
+    def _on_gate_slider(self, value: float) -> None:
+        self._tracker.gate_px = float(value)
+
+    def _on_thresh_slider(self, value: float) -> None:
+        self._tracker.params["thresh"] = int(value)
+
+    def _build_scale_calibration_section(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent)
+        ctk.CTkLabel(f, text="Load Cell Calibration", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=3, padx=8, pady=(4, 2), sticky="w"
+        )
+        ctk.CTkLabel(f, text="1. Remove weight from scale, then:").grid(
+            row=1, column=0, columnspan=3, padx=8, sticky="w"
+        )
+        ctk.CTkButton(f, text="Tare", command=self._on_scale_tare).grid(
+            row=2, column=0, columnspan=3, padx=8, pady=(0, 4), sticky="ew"
+        )
+        ctk.CTkLabel(f, text="2. Place known weight (g):").grid(
+            row=3, column=0, columnspan=3, padx=8, sticky="w"
+        )
+        self._scale_calib_weight_var = ctk.StringVar(value="100")
+        ctk.CTkEntry(f, textvariable=self._scale_calib_weight_var, width=80).grid(
+            row=4, column=0, padx=(8, 2), pady=(0, 4)
+        )
+        ctk.CTkLabel(f, text="g").grid(row=4, column=1, padx=(0, 4), sticky="w")
+        ctk.CTkButton(f, text="Calibrate", command=self._on_scale_calibrate).grid(
+            row=4, column=2, padx=(0, 8), pady=(0, 4), sticky="ew"
+        )
+        ctk.CTkLabel(f, text="3. If calibration value looks correct:").grid(
+            row=5, column=0, columnspan=3, padx=8, sticky="w"
+        )
+        ctk.CTkButton(
+            f, text="Save to EEPROM",
+            fg_color=("green3", "green4"), hover_color=("green4", "green3"),
+            command=self._on_scale_save,
+        ).grid(row=6, column=0, columnspan=3, padx=8, pady=(0, 4), sticky="ew")
+        self._scale_calib_resp_var = ctk.StringVar(value="")
+        ctk.CTkLabel(f, textvariable=self._scale_calib_resp_var, wraplength=240,
+                     text_color="gray70").grid(
+            row=7, column=0, columnspan=3, padx=8, pady=(0, 6), sticky="w"
+        )
+        return f
+
+    def _on_scale_tare(self) -> None:
+        if self._scale_arduino and self._scale_arduino.is_open:
+            self._scale_arduino.write(b"t\n")
+            self._scale_calib_resp_var.set("Sent tare — waiting for response…")
+
+    def _on_scale_calibrate(self) -> None:
+        if self._scale_arduino and self._scale_arduino.is_open:
+            weight_str = self._scale_calib_weight_var.get().strip()
+            self._scale_arduino.write(f"{weight_str}\n".encode())
+            self._scale_calib_resp_var.set(f"Sent {weight_str} g — waiting…")
+
+    def _on_scale_save(self) -> None:
+        if self._scale_arduino and self._scale_arduino.is_open:
+            self._scale_arduino.write(b"y\n")
+            self._scale_calib_resp_var.set("Sent save — waiting for response…")
+
+    def _poll_scale_calib_q(self) -> None:
+        lines: list[str] = []
+        try:
+            while True:
+                lines.append(self._scale_calib_q.get_nowait())
+        except queue.Empty:
+            pass
+        if lines and hasattr(self, "_scale_calib_resp_var"):
+            self._scale_calib_resp_var.set(lines[-1])
+        self.after(200, self._poll_scale_calib_q)
+
+    def _poll_v4_force_display(self) -> None:
+        if hasattr(self, "_v4_force_var"):
+            g = self._sample_scale_latest()
+            if np.isnan(g):
+                self._v4_force_var.set("Force: — g  /  — N")
+            else:
+                n = (g / 1000.0) * _GRAVITY_MPS2
+                self._v4_force_var.set(f"Force: {g:.1f} g  /  {n:.4f} N")
+        self.after(200, self._poll_v4_force_display)
 
     def _build_com_section(self, parent) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent)
@@ -619,7 +760,12 @@ class SensitivityWindow(ctk.CTk):
         self._v4_summary_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_summary_var, anchor="w", justify="left",
                      font=ctk.CTkFont(family="Courier", size=10)).grid(
-            row=6, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
+            row=6, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+        )
+        self._v4_force_var = ctk.StringVar(value="Force: — g  /  — N")
+        ctk.CTkLabel(f, textvariable=self._v4_force_var, anchor="w",
+                     font=ctk.CTkFont(family="Courier", size=11)).grid(
+            row=7, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
         )
         return f
 
@@ -637,8 +783,10 @@ class SensitivityWindow(ctk.CTk):
         v4_states = (V4_CONFIG, V4_CALIBRATING, V4_CALIBRATION_DONE,
                      V4_COLLECTING, V4_PAUSED, V4_COMPLETE)
         visible = {
-            self._com_section:           s == STARTUP,
-            self._arduino_section:       s >= BASELINE,
+            self._com_section:              s == STARTUP,
+            self._detection_params_section: s >= BASELINE,
+            self._scale_calibration_section: s == BASELINE,
+            self._arduino_section:          s >= BASELINE,
             self._position_section:      s >= BASELINE,
             self._jog_section:           s in (BASELINE, CEILING_RAMP, PAUSED) or self._in_countdown,
             self._estop_bar:             s >= BASELINE,
@@ -780,6 +928,7 @@ class SensitivityWindow(ctk.CTk):
                 break
             if not line:
                 continue
+            self._scale_calib_q.put(line)
             m = re.search(r"[-+]?\d*\.?\d+", line)
             if not m:
                 continue
@@ -1953,18 +2102,15 @@ class SensitivityWindow(ctk.CTk):
                 self.after(0, self._update_ender_pos_display)
                 break
 
+            capped = hit_hard_limit
             if hit_hard_limit:
                 self.after(0, lambda _b=bin_id: messagebox.showwarning(
                     "Z Hard Limit Reached",
-                    f"Bin {_b}: descended past {Z_HARD_LIMIT_MM:.1f} mm without losing a "
-                    f"marker. Skipping this bin — investigate manually."
+                    f"Bin {_b}: descended to the {Z_HARD_LIMIT_MM:.1f} mm hard limit "
+                    f"without losing a marker. Capping z_max at {Z_HARD_LIMIT_MM:.1f} mm "
+                    f"for this bin (true ceiling is >= this value)."
                 ))
-                self._v4_skipped_bins.add(bin_id)
-                self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
-                self._ender_sync_cmd("M400")
-                self._ender_z = _CLEARANCE_Z_MM
-                self.after(0, self._update_ender_pos_display)
-                continue
+                z_current = Z_HARD_LIMIT_MM
 
             z_max_mm = -z_current
             z_thresh_mm = 0.90 * z_max_mm
@@ -1988,6 +2134,7 @@ class SensitivityWindow(ctk.CTk):
                 "z_max_mm": round(z_max_mm, 4), "z_thresh_mm": round(z_thresh_mm, 4),
                 "f_max_n": round(f_max_n, 4) if f_max_n is not None else None,
                 "f_thresh_n": round(f_thresh_n, 4) if f_thresh_n is not None else None,
+                "capped": capped,
             }
             self._write_z_thresh_map_checkpoint(complete=False)
             self._save_v4_checkpoint()
@@ -2019,6 +2166,9 @@ class SensitivityWindow(ctk.CTk):
         if f_threshes:
             lines.append(f"F_thresh: mean {sum(f_threshes) / len(f_threshes):.4f} N   "
                          f"range [{min(f_threshes):.4f}, {max(f_threshes):.4f}]")
+        capped_bins = sorted(bid for bid, v in bins.items() if v.get("capped"))
+        if capped_bins:
+            lines.append(f"Capped at hard limit (lower-bound z_max only): {capped_bins}")
         if self._v4_skipped_bins:
             lines.append(f"Skipped bins: {sorted(self._v4_skipped_bins)}")
         self._v4_summary_var.set("\n".join(lines))
@@ -2037,6 +2187,17 @@ class SensitivityWindow(ctk.CTk):
         self._ender_sync_cmd("M400")
         self._ender_z = _CLEARANCE_Z_MM
         self.after(0, self._update_ender_pos_display)
+
+        preflight_f = self._sample_scale_latest()
+        if np.isnan(preflight_f):
+            self.after(0, lambda: messagebox.showerror(
+                "No Force Data",
+                "Load-cell (HX711) is not returning readings.\n"
+                "Check the scale COM port and connection, then re-run collection.\n\n"
+                "No hardware has moved — calibration data is safe.",
+            ))
+            self.after(0, lambda: self._set_state(V4_CALIBRATION_DONE))
+            return
 
         for idx, b in enumerate(bins):
             if self._pause_event.is_set() or self._stop_event.is_set():
@@ -2092,7 +2253,6 @@ class SensitivityWindow(ctk.CTk):
                 mid_loss = False
                 with self._frame_lock:
                     self._frame_buffer.clear()
-                hold_start_ts = time.time()
                 self._recording_active.set()
                 deadline = time.time() + 15.0
                 while True:
@@ -2106,7 +2266,14 @@ class SensitivityWindow(ctk.CTk):
                         break
                     time.sleep(0.005)
                 self._recording_active.clear()
-                hold_end_ts = time.time()
+
+                # Sample force after an additional settle so the viscoelastic
+                # material has time to build toward plateau — matches the same
+                # _sample_scale_latest() method used during calibration.
+                time.sleep(_Z_SETTLE_S)
+                f_actual_g = self._sample_scale_latest()
+                f_actual_n = (f_actual_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_actual_g) else float("nan")
+
                 if self._stop_event.is_set():
                     break
 
@@ -2138,8 +2305,15 @@ class SensitivityWindow(ctk.CTk):
                 with self._frame_lock:
                     frames = list(self._frame_buffer[:30])
 
-                f_actual_g = self._sample_scale_window(hold_start_ts, hold_end_ts)
-                f_actual_n = (f_actual_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_actual_g) else float("nan")
+                if np.isnan(f_actual_n):
+                    self._pause_event.set()
+                    self.after(0, lambda _b=bin_id, _r=rep: messagebox.showwarning(
+                        "Force Reading Lost",
+                        f"Bin {_b} rep {_r}: load-cell returned no data for this hold.\n"
+                        "Collection paused — check scale connection, then Resume.",
+                    ))
+                    self.after(0, lambda: self._set_state(V4_PAUSED))
+                    continue  # rep NOT added to done_reps → retried on resume
 
                 if self._writer_v4:
                     for frame_idx, (records, ts) in enumerate(frames):
@@ -2175,8 +2349,10 @@ class SensitivityWindow(ctk.CTk):
         self._update_v4_progress(f"Collection complete — {len(rows)}/{len(GRID_7X5)} bins")
         self._set_v4_progress_fraction(1.0)
         self._v4_summary_var.set(
-            f"U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm   "
-            f"S_mean = {g['S_mean']:.4f} mm/N   S_std = {g['S_std']:.4f} mm/N\n"
+            f"Sensitivity — U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm   "
+            f"S_global = {g['S_global']:.4f} mm/N   std = {g['S_global_std']:.4f} mm/N   (k={_K_DEFAULT})\n"
+            f"Scalar ref  — U = {g['U_scalar']:.4f}   Rep = {g['Rep_scalar']:.4f} mm   "
+            f"S_mean = {g['S_scalar_mean']:.4f} mm/N   std = {g['S_scalar_std']:.4f} mm/N\n"
             f"Skipped bins: {sorted(self._v4_skipped_bins) if self._v4_skipped_bins else 'none'}"
         )
         self._status_var.set("STATE: V4_COMPLETE — sensitivity_summary.csv and figures saved")
@@ -2185,23 +2361,34 @@ class SensitivityWindow(ctk.CTk):
     # v4 — post-collection metrics & figures
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _compute_v4_metrics(self) -> list[dict]:
+    def _compute_v4_metrics(self, k_override: Optional[int] = None) -> list[dict]:
         df: Optional[pd.DataFrame] = None
         if self._writer_v4 and os.path.exists(self._writer_v4.csv_path):
             df = pd.read_csv(self._writer_v4.csv_path)
+            bpos = self._tracker.baseline_positions_mm
+            df["baseline_x_mm"] = df["marker_id"].map({mid: xy[0] for mid, xy in bpos.items()})
+            df["baseline_y_mm"] = df["marker_id"].map({mid: xy[1] for mid, xy in bpos.items()})
+
+        k = k_override if k_override is not None else _K_DEFAULT
+
+        # Pre-compute all unique marker baseline positions once.
+        all_markers: Optional[pd.DataFrame] = None
+        if df is not None:
+            all_markers = df[["marker_id", "baseline_x_mm", "baseline_y_mm"]].drop_duplicates("marker_id")
 
         rows: list[dict] = []
         for b in GRID_7X5:
             bin_id = b["bin_id"]
-            entry = self._v4_z_thresh_map.get(bin_id)
+            x_mm, y_mm = b["x_mm"], b["y_mm"]
+            entry  = self._v4_z_thresh_map.get(bin_id)
             bin_df = df[df["bin_id"] == bin_id] if df is not None else None
-            flagged = entry is None or bin_id in self._v4_skipped_bins or bin_df is None or bin_df.empty
+            is_flagged = entry is None or bin_id in self._v4_skipped_bins or bin_df is None or bin_df.empty
 
-            if flagged:
+            if is_flagged:
                 rows.append({
                     "bin_id": bin_id,
-                    "bin_x_mm": round(b["x_mm"], 3),
-                    "bin_y_mm": round(b["y_mm"], 3),
+                    "bin_x_mm": round(x_mm, 3),
+                    "bin_y_mm": round(y_mm, 3),
                     "n_markers": 0,
                     "z_thresh_mm": entry["z_thresh_mm"] if entry else float("nan"),
                     "f_thresh_n": (entry.get("f_thresh_n") if entry and entry.get("f_thresh_n") is not None
@@ -2212,10 +2399,18 @@ class SensitivityWindow(ctk.CTk):
                     "S_scalar_mm_per_n": float("nan"),
                     "rep_std_mm": float("nan"),
                     "n_reps": 0,
+                    "n_markers_local": 0,
+                    "d_bar_local_mean_mm": float("nan"),
+                    "d_bar_local_std_mm": float("nan"),
+                    "S_local_mm_per_n": float("nan"),
+                    "rep_std_local_mm": float("nan"),
                 })
                 continue
 
             assert bin_df is not None and entry is not None
+            f_thresh = (float(entry["f_thresh_n"])
+                        if entry.get("f_thresh_n") is not None else float("nan"))
+
             per_rep = bin_df.groupby("rep").agg(
                 d_bar=("magnitude_mm", "mean"),
                 f_actual=("f_actual_n", "mean"),
@@ -2226,13 +2421,48 @@ class SensitivityWindow(ctk.CTk):
             d_bar_mean = float(np.mean(d_all))
             d_bar_std = float(np.std(d_all))
             rep_std = float(np.std(d_bar_values))
-            s_scalar = (d_bar_mean / f_actual_mean) if f_actual_mean and not np.isnan(f_actual_mean) \
+            s_scalar = (d_bar_mean / f_thresh) if f_thresh and not np.isnan(f_thresh) \
                 else float("nan")
+
+            # k nearest markers by Euclidean distance (no rectangular footprint filter).
+            if all_markers is None or all_markers.empty:
+                n_markers_local  = 0
+                d_bar_local_mean = float("nan")
+                d_bar_local_std  = float("nan")
+                s_local          = float("nan")
+                rep_std_local    = float("nan")
+            else:
+                ranked = all_markers.assign(
+                    dist=np.sqrt(
+                        (all_markers["baseline_x_mm"] - x_mm) ** 2 +
+                        (all_markers["baseline_y_mm"] - y_mm) ** 2
+                    )
+                ).sort_values("dist")
+                top_k_ids = set(ranked["marker_id"].iloc[:k].tolist())
+                topk_df   = bin_df[bin_df["marker_id"].isin(top_k_ids)]
+
+                if topk_df.empty:
+                    n_markers_local  = 0
+                    d_bar_local_mean = float("nan")
+                    d_bar_local_std  = float("nan")
+                    s_local          = float("nan")
+                    rep_std_local    = float("nan")
+                else:
+                    per_rep_local    = topk_df.groupby("rep").agg(
+                        d_bar=("magnitude_mm", "mean"),
+                    )
+                    d_local_all      = topk_df["magnitude_mm"].to_numpy(dtype=float)
+                    d_bar_local_mean = float(np.mean(d_local_all))
+                    d_bar_local_std  = float(np.std(d_local_all))
+                    rep_std_local    = float(np.std(per_rep_local["d_bar"].to_numpy(dtype=float)))
+                    s_local          = (d_bar_local_mean / f_thresh
+                                        if f_thresh and not np.isnan(f_thresh) else float("nan"))
+                    n_markers_local  = int(topk_df["marker_id"].nunique())
 
             rows.append({
                 "bin_id": bin_id,
-                "bin_x_mm": round(b["x_mm"], 3),
-                "bin_y_mm": round(b["y_mm"], 3),
+                "bin_x_mm": round(x_mm, 3),
+                "bin_y_mm": round(y_mm, 3),
                 "n_markers": int(bin_df["marker_id"].nunique()),
                 "z_thresh_mm": round(float(entry["z_thresh_mm"]), 4),
                 "f_thresh_n": (round(float(entry["f_thresh_n"]), 4) if entry.get("f_thresh_n") is not None
@@ -2243,20 +2473,39 @@ class SensitivityWindow(ctk.CTk):
                 "S_scalar_mm_per_n": round(s_scalar, 6) if not np.isnan(s_scalar) else float("nan"),
                 "rep_std_mm": round(rep_std, 4),
                 "n_reps": int(len(per_rep)),
+                "n_markers_local": n_markers_local,
+                "d_bar_local_mean_mm": round(d_bar_local_mean, 4) if not np.isnan(d_bar_local_mean) else float("nan"),
+                "d_bar_local_std_mm": round(d_bar_local_std, 4) if not np.isnan(d_bar_local_std) else float("nan"),
+                "S_local_mm_per_n": round(s_local, 6) if not np.isnan(s_local) else float("nan"),
+                "rep_std_local_mm": round(rep_std_local, 4) if not np.isnan(rep_std_local) else float("nan"),
             })
         return rows
 
     def _compute_global_metrics(self, rows: list[dict]) -> dict[str, float]:
-        s_vals = np.array([r["S_scalar_mm_per_n"] for r in rows], dtype=float)
-        s_vals = s_vals[~np.isnan(s_vals)]
+        def _stats(key: str) -> tuple[float, float, float]:
+            v = np.array([r[key] for r in rows], dtype=float)
+            v = v[~np.isnan(v)]
+            mu = float(np.mean(v)) if v.size else float("nan")
+            sig = float(np.std(v)) if v.size else float("nan")
+            u = (1.0 / (1.0 + sig / abs(mu))) if v.size and mu != 0 else float("nan")
+            return mu, sig, u
+
+        # Primary (Taceva): global = mean of per-bin local sensitivities
+        mu_l, sig_l, u_l = _stats("S_local_mm_per_n")
+        rep_local = np.array([r["rep_std_local_mm"] for r in rows], dtype=float)
+        rep_local = rep_local[~np.isnan(rep_local)]
+        rep_l = float(np.mean(rep_local)) if rep_local.size else float("nan")
+
+        # Reference: scalar (all-marker average, kept for cross-method comparison)
+        mu, sigma, u = _stats("S_scalar_mm_per_n")
         rep_vals = np.array([r["rep_std_mm"] for r in rows], dtype=float)
         rep_vals = rep_vals[~np.isnan(rep_vals)]
+        rep = float(np.mean(rep_vals)) if rep_vals.size else float("nan")
 
-        mu    = float(np.mean(s_vals)) if s_vals.size else float("nan")
-        sigma = float(np.std(s_vals))  if s_vals.size else float("nan")
-        u     = (1.0 / (1.0 + sigma / abs(mu))) if s_vals.size and mu != 0 else float("nan")
-        rep   = float(np.mean(rep_vals)) if rep_vals.size else float("nan")
-        return {"U": u, "Rep": rep, "S_mean": mu, "S_std": sigma}
+        return {
+            "U": u_l, "Rep": rep_l, "S_global": mu_l, "S_global_std": sig_l,
+            "U_scalar": u, "Rep_scalar": rep, "S_scalar_mean": mu, "S_scalar_std": sigma,
+        }
 
     def _generate_v4_figures(self, rows: list[dict]) -> None:
         plt.style.use(["science", "no-latex"])
@@ -2272,9 +2521,11 @@ class SensitivityWindow(ctk.CTk):
             return arr
 
         for key, fname, cmap in (
-            ("S_scalar_mm_per_n", f"sensitivity_map{suffix}.png",   "viridis"),
-            ("z_thresh_mm",       f"z_thresh_map{suffix}.png",      "plasma"),
-            ("rep_std_mm",        f"repeatability_map{suffix}.png", "coolwarm"),
+            ("S_scalar_mm_per_n", f"sensitivity_map{suffix}.png",         "viridis"),
+            ("S_local_mm_per_n",  f"sensitivity_local_map{suffix}.png",   "viridis"),
+            ("z_thresh_mm",       f"z_thresh_map{suffix}.png",            "plasma"),
+            ("rep_std_mm",        f"repeatability_map{suffix}.png",       "coolwarm"),
+            ("rep_std_local_mm",  f"repeatability_local_map{suffix}.png", "coolwarm"),
         ):
             fig, ax = plt.subplots()
             im = ax.imshow(_grid(key), cmap=cmap)
@@ -2286,19 +2537,24 @@ class SensitivityWindow(ctk.CTk):
             plt.close(fig)
 
         bin_ids = [r["bin_id"] for r in rows]
-        s_vals  = [r["S_scalar_mm_per_n"] for r in rows]
-        s_stds  = [r["d_bar_std_mm"] for r in rows]
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.bar(bin_ids, s_vals, yerr=s_stds, capsize=2)
-        ax.set_xlabel("Bin ID")
-        ax.set_ylabel("S_scalar (mm/N)")
-        title = "Per-bin scalar sensitivity"
-        if self._v4_blend_id:
-            title += f" — {self._v4_blend_id}"
-        ax.set_title(title)
-        fig.savefig(os.path.join(self._session_dir, f"sensitivity_bar{suffix}.png"),
-                    dpi=200, bbox_inches="tight")
-        plt.close(fig)
+
+        for y_key, err_key, ylabel, fname_stem, title_label in (
+            ("S_scalar_mm_per_n", "d_bar_std_mm",       "S_scalar (mm/N)", "sensitivity_bar",       "Per-bin scalar sensitivity (global)"),
+            ("S_local_mm_per_n",  "d_bar_local_std_mm", "S_local (mm/N)",  "sensitivity_local_bar", "Per-bin scalar sensitivity (local)"),
+        ):
+            s_vals = [r[y_key]   for r in rows]
+            s_stds = [r[err_key] for r in rows]
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.bar(bin_ids, s_vals, yerr=s_stds, capsize=2)
+            ax.set_xlabel("Bin ID")
+            ax.set_ylabel(ylabel)
+            title = title_label
+            if self._v4_blend_id:
+                title += f" — {self._v4_blend_id}"
+            ax.set_title(title)
+            fig.savefig(os.path.join(self._session_dir, f"{fname_stem}{suffix}.png"),
+                        dpi=200, bbox_inches="tight")
+            plt.close(fig)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Window close
