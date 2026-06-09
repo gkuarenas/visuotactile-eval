@@ -2412,10 +2412,10 @@ class SensitivityWindow(ctk.CTk):
                         if entry.get("f_thresh_n") is not None else float("nan"))
 
             per_rep = bin_df.groupby("rep").agg(
-                d_bar=("magnitude_mm", "mean"),
+                d_bar=("delta_z_mm", lambda x: np.abs(x).mean()),
                 f_actual=("f_actual_n", "mean"),
             )
-            d_all = bin_df["magnitude_mm"].to_numpy(dtype=float)
+            d_all = np.abs(bin_df["delta_z_mm"].to_numpy(dtype=float))
             d_bar_values = per_rep["d_bar"].to_numpy(dtype=float)
             f_actual_mean = float(np.nanmean(per_rep["f_actual"].to_numpy(dtype=float)))
             d_bar_mean = float(np.mean(d_all))
@@ -2449,9 +2449,9 @@ class SensitivityWindow(ctk.CTk):
                     rep_std_local    = float("nan")
                 else:
                     per_rep_local    = topk_df.groupby("rep").agg(
-                        d_bar=("magnitude_mm", "mean"),
+                        d_bar=("delta_z_mm", lambda x: np.abs(x).mean()),
                     )
-                    d_local_all      = topk_df["magnitude_mm"].to_numpy(dtype=float)
+                    d_local_all      = np.abs(topk_df["delta_z_mm"].to_numpy(dtype=float))
                     d_bar_local_mean = float(np.mean(d_local_all))
                     d_bar_local_std  = float(np.std(d_local_all))
                     rep_std_local    = float(np.std(per_rep_local["d_bar"].to_numpy(dtype=float)))
