@@ -77,6 +77,16 @@ class Ender3V2Controller:
     def home_all_axes(self):
         self.send_command("G28")
 
+    def press_to_z(self, z_thresh_mm: float, feed: int = 300) -> None:
+        self.send_command("G90")
+        self.send_command(f"G1 Z{z_thresh_mm:.3f} F{feed}")
+        self.send_command("M400")
+
+    def retract_home(self, clearance_mm: float = 3.0, feed: int = 300) -> None:
+        self.send_command("G90")
+        self.send_command(f"G1 Z{clearance_mm:.3f} F{feed}")
+        self.send_command("M400")
+
     def emergency_stop(self):
         self.send_command("M112", wait_for_ok=False)
 

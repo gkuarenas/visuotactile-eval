@@ -34,6 +34,7 @@ from output.sensitivity_writer import (
     write_z_thresh_map, load_z_thresh_map,
 )
 from output.checkpoint import CheckpointManager, CheckpointManagerV4
+from ui.stability_window import StabilityWindow
 
 
 # ── State constants ──────────────────────────────────────────────────────────
@@ -279,6 +280,9 @@ class SensitivityWindow(ctk.CTk):
         # State
         self._state = STARTUP
 
+        # Stability window reference — ensures only one instance can be open
+        self._stability_win: Optional[StabilityWindow] = None
+
         self._build_ui()
         self._check_for_resume()
         self._check_for_v4_resume()
@@ -327,6 +331,7 @@ class SensitivityWindow(ctk.CTk):
         self._grid_progress_section = self._build_grid_progress_section(rp)
         self._session_controls      = self._build_session_controls(rp)
         self._v4_section            = self._build_v4_section(rp)
+        self._stability_section     = self._build_stability_section(rp)
 
         # Ordered list used by _apply_visibility for deterministic pack order
         self._rp_sections = [
@@ -342,6 +347,7 @@ class SensitivityWindow(ctk.CTk):
             self._grid_progress_section,
             self._v4_section,
             self._session_controls,
+            self._stability_section,
         ]
         self._apply_visibility()
         self.after(200, self._poll_scale_calib_q)
@@ -769,6 +775,25 @@ class SensitivityWindow(ctk.CTk):
         )
         return f
 
+    def _build_stability_section(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent)
+        ctk.CTkLabel(f, text="Stability Test", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(4, 2)
+        )
+        self._stability_launch_btn = ctk.CTkButton(
+            f, text="Launch Stability Test", width=180,
+            command=self._on_launch_stability,
+        )
+        self._stability_launch_btn.pack(anchor="w", padx=8, pady=(0, 6))
+        return f
+
+    def _on_launch_stability(self) -> None:
+        if self._stability_win is not None and self._stability_win.winfo_exists():
+            self._stability_win.lift()
+            return
+        self._stability_launch_btn.configure(state="disabled")
+        self._stability_win = StabilityWindow(self)
+
     # ══════════════════════════════════════════════════════════════════════════
     # State machine
     # ══════════════════════════════════════════════════════════════════════════
@@ -795,6 +820,7 @@ class SensitivityWindow(ctk.CTk):
             self._grid_progress_section: s in (GRID_RUNNING, PAUSED),
             self._v4_section:            s == BASELINE or s in v4_states,
             self._session_controls:      s in (GRID_RUNNING, PAUSED) or s in (V4_CALIBRATING, V4_COLLECTING, V4_PAUSED),
+            self._stability_section:     s >= BASELINE,
         }
         for w in self._rp_sections:
             w.pack_forget()
