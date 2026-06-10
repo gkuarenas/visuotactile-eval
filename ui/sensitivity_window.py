@@ -1,7 +1,9 @@
 """
 ui/sensitivity_window.py
-State machine: STARTUP(0) -> BASELINE(1) -> CEILING_RAMP(2) -> FORCE_ENTRY(3)
-               -> GRID_RUNNING(4) <-> PAUSED(5) -> COMPLETE(6)
+State machine: STARTUP(0) -> BASELINE(1) -> HUB(13)
+               -> [Sensitivity] V4_CONFIG(7)..V4_COMPLETE(12)
+               -> [Stability]   ST_PANEL_IDLE(14)..ST_PANEL_DONE(16)
+               -> [Hysteresis]  HY_PANEL_IDLE(17)..HY_PANEL_DONE(19)
 """
 import os
 import re
@@ -29,25 +31,22 @@ from core.tracker import Tracker, MarkerRecord
 from ui.overlay import draw_overlay
 from ender.jog_control import Ender3V2Controller
 from output.sensitivity_writer import (
-    SensitivityWriter, write_marker_baselines,
+    write_marker_baselines,
     SensitivityWriterV4, write_sensitivity_summary,
     write_z_thresh_map, load_z_thresh_map,
 )
-from output.checkpoint import CheckpointManager, CheckpointManagerV4
-from ui.stability_window import StabilityWindow
+import io
+from output.checkpoint import CheckpointManagerV4, CheckpointManagerHysteresis
+from output.stability_writer import StabilityWriter, write_stability_summary_partial
+from output.hysteresis_writer import HysteresisWriter, write_hysteresis_summary
 
 
 # ── State constants ──────────────────────────────────────────────────────────
 
-STARTUP      = 0
-BASELINE     = 1
-CEILING_RAMP = 2
-FORCE_ENTRY  = 3
-GRID_RUNNING = 4
-PAUSED       = 5
-COMPLETE     = 6
+STARTUP  = 0
+BASELINE = 1
 
-# v4 protocol states — branch off BASELINE; v3 states/UI stay intact
+# v4 protocol states
 V4_CONFIG           = 7
 V4_CALIBRATING      = 8
 V4_CALIBRATION_DONE = 9
@@ -55,20 +54,31 @@ V4_COLLECTING       = 10
 V4_PAUSED           = 11
 V4_COMPLETE         = 12
 
+# Hub and inline panel states
+HUB              = 13
+ST_PANEL_IDLE    = 14
+ST_PANEL_RUNNING = 15
+ST_PANEL_DONE    = 16
+HY_PANEL_IDLE    = 17
+HY_PANEL_SWEEPING = 18
+HY_PANEL_DONE    = 19
+
 STATE_NAMES = {
-    STARTUP:      "STARTUP",
-    BASELINE:     "BASELINE",
-    CEILING_RAMP: "CEILING_RAMP",
-    FORCE_ENTRY:  "FORCE_ENTRY",
-    GRID_RUNNING: "GRID_RUNNING",
-    PAUSED:       "PAUSED",
-    COMPLETE:     "COMPLETE",
+    STARTUP:  "STARTUP",
+    BASELINE: "BASELINE",
     V4_CONFIG:           "V4_CONFIG",
     V4_CALIBRATING:      "V4_CALIBRATING",
     V4_CALIBRATION_DONE: "V4_CALIBRATION_DONE",
     V4_COLLECTING:       "V4_COLLECTING",
     V4_PAUSED:           "V4_PAUSED",
     V4_COMPLETE:         "V4_COMPLETE",
+    HUB:              "HUB",
+    ST_PANEL_IDLE:    "ST_PANEL_IDLE",
+    ST_PANEL_RUNNING: "ST_PANEL_RUNNING",
+    ST_PANEL_DONE:    "ST_PANEL_DONE",
+    HY_PANEL_IDLE:     "HY_PANEL_IDLE",
+    HY_PANEL_SWEEPING: "HY_PANEL_SWEEPING",
+    HY_PANEL_DONE:     "HY_PANEL_DONE",
 }
 
 _RIGHT_W = 430
@@ -104,6 +114,20 @@ _TRACKING_LOSS_STRIKES = 3  # consecutive mid-press tracking-loss reps before a 
 _SCALE_BAUD = 57600
 _SCALE_BUFFER_MAXLEN = 2000     # ring buffer capacity (~25 s of headroom at 80 Hz)
 _SCALE_SAMPLE_WINDOW_S = 0.2    # trailing window averaged for a single-point sample
+
+# ── Stability panel constants ─────────────────────────────────────────────────
+_ST_HOLD_FRAMES      = 900   # 30 s at 30 fps
+_ST_SETTLE_FRAMES    = 60    # 2 s at 30 fps — discarded before hold
+_ST_BASELINE_FRAMES  = 60    # 2 s pre-flight check
+_ST_BASELINE_GATE_MM = 0.05  # max mean abs(delta_z_mm) at rest
+_ST_FPS              = 30.0
+_ST_CENTER_BIN_ID    = 18    # row=2, col=3 in the 7x5 grid
+_ST_PLOT_W_PX        = 400
+_ST_PLOT_H_PX        = 160
+
+# ── Hysteresis panel constants ────────────────────────────────────────────────
+_HY_LOADING_FRAMES   = 30
+_HY_UNLOADING_FRAMES = 30
 
 
 # ── Module helpers ────────────────────────────────────────────────────────────
@@ -195,9 +219,7 @@ class SensitivityWindow(ctk.CTk):
         self.columnconfigure(0, weight=1)
 
         # Core objects
-        self._tracker    = Tracker("calibration.json")
-        self._bin_positions = compute_grid_positions()
-        self._checkpoint = CheckpointManager()
+        self._tracker = Tracker("calibration.json")
 
         # Camera
         self._cap: Optional[cv2.VideoCapture] = None
@@ -236,33 +258,13 @@ class SensitivityWindow(ctk.CTk):
         self._scale_lock = threading.Lock()
         self._scale_calib_q: queue.Queue[str] = queue.Queue()
 
-        # Session parameters — per-bin ceiling-ramp calibration (one ramp per
-        # grid position, since F_max differs by proximity to the rigid edges)
-        self._f_max       = 0.0   # scratch values for the ramp currently being entered
-        self._f_threshold = 0.0
-        self._z_threshold = 0.0
-        self._bin_force_levels: dict[int, list[tuple[str, float, float]]] = {}  # bin_id -> [(label, force_n, z_mm), ...]
-        self._ramp_bin_idx = 0    # index into _bin_positions for the calibration loop
-
-        # Grid loop state
-        self._grid_thread: Optional[threading.Thread] = None
-        self._pause_event = threading.Event()   # soft pause — honoured between windows
-        self._stop_event  = threading.Event()   # hard stop — E-Stop / Abort (kills immediately)
-        self._current_bin_idx   = 0  # index into _bin_positions
-        self._current_rep       = 1
-        self._current_level_idx = 0
-        self._last_completed_bin_id = 0
-        self._skip_bin_entry = False  # True when resuming mid-bin (skip XY move + countdown)
-        self._in_countdown   = False
-        self._session_start_t = 0.0
+        # v4 loop control events
+        self._pause_event = threading.Event()
+        self._stop_event  = threading.Event()
 
         # Output
         self._session_dir = ""
         self._session_ts  = ""
-        self._writer: Optional[SensitivityWriter] = None
-
-        # Resume
-        self._resume_checkpoint: Optional[dict] = None
 
         # ── v4 protocol state ─────────────────────────────────────────────
         self._checkpoint_v4 = CheckpointManagerV4()
@@ -280,11 +282,39 @@ class SensitivityWindow(ctk.CTk):
         # State
         self._state = STARTUP
 
-        # Stability window reference — ensures only one instance can be open
-        self._stability_win: Optional[StabilityWindow] = None
+        # ── Stability panel state ─────────────────────────────────────────────
+        self._st_msg_q: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._st_state  = ST_PANEL_IDLE
+        self._st_stop_ev = threading.Event()
+        self._st_worker: Optional[threading.Thread] = None
+        self._st_blend_id = ""
+        self._st_session_dir = ""
+        self._st_z_thresh_mm = 0.0
+        self._st_writer: Optional[StabilityWriter] = None
+        self._st_hold_means: list[float] = []
+        self._st_drift_0s_mm: Optional[float] = None
+        self._st_drift_3s_mm: Optional[float] = None
+        self._st_delta_drift_mm: Optional[float] = None
+        self._st_drift_rate_mm_per_s: Optional[float] = None
+        self._st_plot_photo: Optional[ImageTk.PhotoImage] = None
+
+        # ── Hysteresis panel state ────────────────────────────────────────────
+        self._hy_msg_q: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._hy_state     = HY_PANEL_IDLE
+        self._hy_stop_ev   = threading.Event()
+        self._hy_worker: Optional[threading.Thread] = None
+        self._hy_blend_id  = ""
+        self._hy_session_dir = ""
+        self._hy_session_ts  = ""
+        self._hy_z_thresh_map: dict[int, dict] = {}
+        self._hy_z_retract_mm = 5.0
+        self._hy_writer: Optional[HysteresisWriter] = None
+        self._hy_checkpoint = CheckpointManagerHysteresis()
+        self._hy_bins_completed: list[int] = []
+        self._hy_bins_skipped:   list[int] = []
+        self._hy_per_bin_status: dict[str, dict[str, object]] = {}
 
         self._build_ui()
-        self._check_for_resume()
         self._check_for_v4_resume()
         self._frame_loop()
         self._ender_process_responses()
@@ -319,19 +349,17 @@ class SensitivityWindow(ctk.CTk):
         ).pack(fill="x", padx=8, pady=(6, 2))
 
         # Build all section frames (packed here in display order; _apply_visibility controls visibility)
-        self._com_section                = self._build_com_section(rp)
-        self._detection_params_section   = self._build_detection_params_section(rp)
-        self._scale_calibration_section  = self._build_scale_calibration_section(rp)
-        self._arduino_section            = self._build_arduino_section(rp)
-        self._position_section      = self._build_position_section(rp)
-        self._jog_section           = self._build_jog_section(rp)
-        self._estop_bar             = self._build_estop_bar(rp)
-        self._ceiling_section       = self._build_ceiling_section(rp)
-        self._force_section         = self._build_force_section(rp)
-        self._grid_progress_section = self._build_grid_progress_section(rp)
-        self._session_controls      = self._build_session_controls(rp)
-        self._v4_section            = self._build_v4_section(rp)
-        self._stability_section     = self._build_stability_section(rp)
+        self._com_section               = self._build_com_section(rp)
+        self._detection_params_section  = self._build_detection_params_section(rp)
+        self._scale_calibration_section = self._build_scale_calibration_section(rp)
+        self._arduino_section           = self._build_arduino_section(rp)
+        self._position_section          = self._build_position_section(rp)
+        self._jog_section               = self._build_jog_section(rp)
+        self._estop_bar                 = self._build_estop_bar(rp)
+        self._hub_section               = self._build_hub_section(rp)
+        self._v4_section                = self._build_v4_section(rp)
+        self._stability_panel           = self._build_stability_panel(rp)
+        self._hysteresis_panel          = self._build_hysteresis_panel(rp)
 
         # Ordered list used by _apply_visibility for deterministic pack order
         self._rp_sections = [
@@ -342,16 +370,16 @@ class SensitivityWindow(ctk.CTk):
             self._position_section,
             self._jog_section,
             self._estop_bar,
-            self._ceiling_section,
-            self._force_section,
-            self._grid_progress_section,
+            self._hub_section,
             self._v4_section,
-            self._session_controls,
-            self._stability_section,
+            self._stability_panel,
+            self._hysteresis_panel,
         ]
         self._apply_visibility()
         self.after(200, self._poll_scale_calib_q)
         self.after(200, self._poll_v4_force_display)
+        self.after(100, self._poll_st_msg_q)
+        self.after(100, self._poll_hy_msg_q)
 
     # ── Section builders ──────────────────────────────────────────────────────
 
@@ -607,120 +635,10 @@ class SensitivityWindow(ctk.CTk):
         ).pack(side="left")
         return f
 
-    def _build_ceiling_section(self, parent) -> ctk.CTkFrame:
-        f = ctk.CTkFrame(parent)
-        ctk.CTkLabel(f, text="Ceiling Ramp", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(4, 2), sticky="w"
-        )
-        self._ramp_var = ctk.StringVar(value="Ramp:  — / 9")
-        ctk.CTkLabel(f, textvariable=self._ramp_var, anchor="w",
-                     font=ctk.CTkFont(family="Courier", size=12)).grid(
-            row=1, column=0, columnspan=3, padx=8, pady=(0, 2), sticky="w"
-        )
-        ctk.CTkLabel(
-            f,
-            text="Indenter is positioned at this bin's centroid.\n"
-                 "Jog Z down until the scale reads F_threshold (g).\n"
-                 "Enter F_max (g) and z_threshold (mm) below.",
-            justify="left", anchor="w",
-        ).grid(row=2, column=0, columnspan=3, padx=8, pady=(0, 4), sticky="w")
-        ctk.CTkLabel(f, text="F_max (g):").grid(row=3, column=0, padx=(8, 2), sticky="e")
-        self._mass_fmax_var = ctk.StringVar()
-        self._mass_fmax_var.trace_add("write", self._on_mass_fmax_changed)
-        ctk.CTkEntry(f, textvariable=self._mass_fmax_var, width=90).grid(row=3, column=1, padx=(0, 8), pady=2, sticky="w")
-        ctk.CTkLabel(f, text="F_max (N):").grid(row=4, column=0, padx=(8, 2), sticky="e")
-        self._fmax_n_var = ctk.StringVar(value="—")
-        ctk.CTkLabel(f, textvariable=self._fmax_n_var, anchor="w", width=90).grid(
-            row=4, column=1, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="F_threshold (N):").grid(row=5, column=0, padx=(8, 2), sticky="e")
-        self._fthr_var = ctk.StringVar(value="—")
-        ctk.CTkLabel(f, textvariable=self._fthr_var, anchor="w", width=90).grid(
-            row=5, column=1, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="F_threshold (g):").grid(row=6, column=0, padx=(8, 2), sticky="e")
-        self._mass_fthr_var = ctk.StringVar(value="—")
-        ctk.CTkLabel(f, textvariable=self._mass_fthr_var, anchor="w", width=90).grid(
-            row=6, column=1, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="z_threshold (mm):").grid(row=7, column=0, padx=(8, 2), sticky="e")
-        self._zthr_var = ctk.StringVar()
-        ctk.CTkEntry(f, textvariable=self._zthr_var, width=90).grid(row=7, column=1, padx=(0, 8), pady=2, sticky="w")
-        ctk.CTkButton(f, text="Confirm", width=100, command=self._on_confirm_ceiling).grid(
-            row=8, column=0, columnspan=2, padx=8, pady=(4, 2), sticky="w"
-        )
-        self._ramp_back_btn = ctk.CTkButton(
-            f, text="Back to Baseline", width=140,
-            fg_color="gray40", hover_color="gray30",
-            command=self._on_ramp_back_to_baseline,
-        )
-        self._ramp_back_btn.grid(row=9, column=0, columnspan=2, padx=8, pady=(0, 6), sticky="w")
-        return f
-
-    def _build_force_section(self, parent) -> ctk.CTkFrame:
-        f = ctk.CTkFrame(parent)
-        ctk.CTkLabel(f, text="Force Levels", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky="w"
-        )
-        self._level_vars: list[ctk.StringVar] = []
-        for i in range(4):
-            v = ctk.StringVar(value=f"L{i + 1}: — N  |  Z: — mm")
-            self._level_vars.append(v)
-            ctk.CTkLabel(f, textvariable=v, anchor="w",
-                         font=ctk.CTkFont(family="Courier", size=12)).grid(
-                row=i + 1, column=0, columnspan=2, padx=8, pady=1, sticky="w"
-            )
-        self._start_grid_btn = ctk.CTkButton(
-            f, text="Start Grid", width=120, command=self._on_start_grid
-        )
-        self._start_grid_btn.grid(row=5, column=0, columnspan=2, padx=8, pady=(4, 6), sticky="w")
-        return f
-
-    def _build_grid_progress_section(self, parent) -> ctk.CTkFrame:
-        f = ctk.CTkFrame(parent)
-        ctk.CTkLabel(f, text="Grid Progress", font=ctk.CTkFont(weight="bold")).pack(
-            anchor="w", padx=8, pady=(4, 2)
-        )
-        self._grid_bin_var     = ctk.StringVar(value="Bin:   — / 9")
-        self._grid_rep_var     = ctk.StringVar(value="Rep:   — / 10")
-        self._grid_level_var   = ctk.StringVar(value="Force: —")
-        self._grid_frame_var   = ctk.StringVar(value="Frame: — / 30")
-        self._grid_rest_var    = ctk.StringVar(value="")
-        self._grid_elapsed_var = ctk.StringVar(value="Elapsed: —")
-        for v in (self._grid_bin_var, self._grid_rep_var, self._grid_level_var,
-                  self._grid_frame_var, self._grid_rest_var, self._grid_elapsed_var):
-            ctk.CTkLabel(f, textvariable=v, anchor="w",
-                         font=ctk.CTkFont(family="Courier", size=12)).pack(
-                anchor="w", padx=8, pady=1
-            )
-        return f
-
-    def _build_session_controls(self, parent) -> ctk.CTkFrame:
-        f = ctk.CTkFrame(parent)
-        ctk.CTkLabel(f, text="Session Controls", font=ctk.CTkFont(weight="bold")).pack(
-            anchor="w", padx=8, pady=(4, 2)
-        )
-        br = ctk.CTkFrame(f, fg_color="transparent")
-        br.pack(fill="x", padx=8, pady=(0, 6))
-        self._pause_btn = ctk.CTkButton(br, text="Pause",  width=90, command=self._on_pause)
-        self._pause_btn.pack(side="left", padx=(0, 6))
-        self._resume_btn = ctk.CTkButton(br, text="Resume", width=90, command=self._on_resume)
-        self._resume_btn.pack(side="left", padx=(0, 6))
-        self._abort_btn = ctk.CTkButton(br, text="Abort", width=90,
-                                        fg_color="gray40", hover_color="gray30",
-                                        command=self._on_abort)
-        self._abort_btn.pack(side="left")
-        return f
-
     def _build_v4_section(self, parent) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent)
         ctk.CTkLabel(f, text="Sensitivity v4", font=ctk.CTkFont(weight="bold")).grid(
             row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky="w"
-        )
-        self._v4_enabled_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(f, text="Use v4 protocol for this session",
-                        variable=self._v4_enabled_var).grid(
-            row=0, column=2, columnspan=2, padx=8, pady=(4, 2), sticky="e"
         )
         ctk.CTkLabel(f, text="Blend ID:").grid(row=1, column=0, padx=(8, 2), sticky="e")
         self._v4_blend_id_var = ctk.StringVar(value="")
@@ -754,45 +672,200 @@ class SensitivityWindow(ctk.CTk):
                                           command=self._on_v4_load_calibration)
         self._v4_load_btn.pack(side="left")
 
+        ctrl_row = ctk.CTkFrame(f, fg_color="transparent")
+        ctrl_row.grid(row=4, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w")
+        self._v4_pause_btn = ctk.CTkButton(ctrl_row, text="Pause", width=80, state="disabled",
+                                           command=self._on_v4_pause)
+        self._v4_pause_btn.pack(side="left", padx=(0, 6))
+        self._v4_resume_btn = ctk.CTkButton(ctrl_row, text="Resume", width=80, state="disabled",
+                                            command=self._on_v4_resume)
+        self._v4_resume_btn.pack(side="left", padx=(0, 6))
+        self._v4_return_btn = ctk.CTkButton(
+            ctrl_row, text="Return to Hub", width=110,
+            fg_color="gray40", hover_color="gray30",
+            state="disabled", command=self._v4_on_return_to_hub,
+        )
+        self._v4_return_btn.pack(side="left")
+
         self._v4_progress_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_progress_var, anchor="w",
                      font=ctk.CTkFont(family="Courier", size=11), wraplength=_RIGHT_W - 20).grid(
-            row=4, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+            row=5, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
         )
         self._v4_progress_bar = ctk.CTkProgressBar(f, width=_RIGHT_W - 60)
         self._v4_progress_bar.set(0.0)
-        self._v4_progress_bar.grid(row=5, column=0, columnspan=4, padx=8, pady=(2, 4), sticky="w")
+        self._v4_progress_bar.grid(row=6, column=0, columnspan=4, padx=8, pady=(2, 4), sticky="w")
 
         self._v4_summary_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_summary_var, anchor="w", justify="left",
                      font=ctk.CTkFont(family="Courier", size=10)).grid(
-            row=6, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+            row=7, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
         )
         self._v4_force_var = ctk.StringVar(value="Force: — g  /  — N")
         ctk.CTkLabel(f, textvariable=self._v4_force_var, anchor="w",
                      font=ctk.CTkFont(family="Courier", size=11)).grid(
-            row=7, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
+            row=8, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
         )
         return f
 
-    def _build_stability_section(self, parent) -> ctk.CTkFrame:
+    def _build_hub_section(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent)
+        ctk.CTkLabel(f, text="Test Selection", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(4, 2)
+        )
+        ctk.CTkButton(
+            f, text="Sensitivity (v4)", width=200,
+            command=self._on_hub_sensitivity,
+        ).pack(anchor="w", padx=8, pady=(4, 2))
+        ctk.CTkButton(
+            f, text="Stability Test", width=200,
+            command=self._on_hub_stability,
+        ).pack(anchor="w", padx=8, pady=2)
+        ctk.CTkButton(
+            f, text="Hysteresis Test", width=200,
+            command=self._on_hub_hysteresis,
+        ).pack(anchor="w", padx=8, pady=(2, 6))
+        return f
+
+    def _on_hub_sensitivity(self) -> None:
+        self._set_state(V4_CONFIG)
+        self._status_var.set("STATE: V4_CONFIG — set Blend ID / params, then Calibration or Load Calibration")
+
+    def _on_hub_stability(self) -> None:
+        self._st_state = ST_PANEL_IDLE
+        self._st_stop_ev.clear()
+        self._set_state(ST_PANEL_IDLE)
+
+    def _on_hub_hysteresis(self) -> None:
+        self._hy_state = HY_PANEL_IDLE
+        self._hy_stop_ev.clear()
+        self._set_state(HY_PANEL_IDLE)
+
+    def _build_stability_panel(self, parent) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent)
         ctk.CTkLabel(f, text="Stability Test", font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(4, 2)
         )
-        self._stability_launch_btn = ctk.CTkButton(
-            f, text="Launch Stability Test", width=180,
-            command=self._on_launch_stability,
+
+        setup = ctk.CTkFrame(f, fg_color="transparent")
+        setup.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(setup, text="Blend ID:").grid(row=0, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._st_blend_var = ctk.StringVar(value="")
+        ctk.CTkEntry(setup, textvariable=self._st_blend_var, width=100).grid(
+            row=0, column=1, padx=(0, 4), pady=2, sticky="w"
         )
-        self._stability_launch_btn.pack(anchor="w", padx=8, pady=(0, 6))
+        ctk.CTkLabel(setup, text="Session folder:").grid(row=1, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._st_folder_var = ctk.StringVar(value="")
+        ctk.CTkEntry(setup, textvariable=self._st_folder_var, width=180).grid(
+            row=1, column=1, padx=(0, 4), pady=2, sticky="w"
+        )
+        ctk.CTkButton(setup, text="Browse", width=60, command=self._st_on_browse).grid(
+            row=1, column=2, padx=(0, 4), pady=2
+        )
+        self._st_z_thresh_info_var = ctk.StringVar(value="z_thresh: —")
+        ctk.CTkLabel(setup, textvariable=self._st_z_thresh_info_var,
+                     font=ctk.CTkFont(family="Courier", size=10), anchor="w").grid(
+            row=2, column=0, columnspan=3, padx=4, pady=(0, 4), sticky="w"
+        )
+
+        btn_row = ctk.CTkFrame(f, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._st_start_btn = ctk.CTkButton(btn_row, text="Start", width=80, command=self._st_on_start)
+        self._st_start_btn.pack(side="left", padx=(0, 6))
+        self._st_estop_btn = ctk.CTkButton(
+            btn_row, text="E-STOP", width=80,
+            fg_color="red", hover_color="#aa0000",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._st_on_estop, state="disabled",
+        )
+        self._st_estop_btn.pack(side="left", padx=(0, 6))
+        self._st_again_btn = ctk.CTkButton(
+            btn_row, text="Run Another", width=100, state="disabled",
+            command=self._st_on_run_another,
+        )
+        self._st_again_btn.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            btn_row, text="Return to Hub", width=110,
+            fg_color="gray40", hover_color="gray30",
+            command=self._st_on_return_to_hub,
+        ).pack(side="left")
+
+        self._st_progress_var = ctk.StringVar(value="")
+        ctk.CTkLabel(f, textvariable=self._st_progress_var,
+                     font=ctk.CTkFont(family="Courier", size=10), anchor="w").pack(
+            fill="x", padx=8, pady=(2, 0)
+        )
+        self._st_plot_label = ctk.CTkLabel(f, text="")
+        self._st_plot_label.pack(fill="x", padx=8, pady=4)
+        self._st_drift_var = ctk.StringVar(value="")
+        self._st_result_lbl = ctk.CTkLabel(
+            f, textvariable=self._st_drift_var,
+            font=ctk.CTkFont(family="Courier", size=11, weight="bold"),
+            anchor="w", justify="left",
+        )
         return f
 
-    def _on_launch_stability(self) -> None:
-        if self._stability_win is not None and self._stability_win.winfo_exists():
-            self._stability_win.lift()
-            return
-        self._stability_launch_btn.configure(state="disabled")
-        self._stability_win = StabilityWindow(self)
+    def _build_hysteresis_panel(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent)
+        ctk.CTkLabel(f, text="Hysteresis Test", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(4, 2)
+        )
+
+        setup = ctk.CTkFrame(f, fg_color="transparent")
+        setup.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(setup, text="Blend ID:").grid(row=0, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._hy_blend_var = ctk.StringVar(value="")
+        ctk.CTkEntry(setup, textvariable=self._hy_blend_var, width=110).grid(
+            row=0, column=1, padx=(0, 4), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(setup, text="Z Retract (mm):").grid(row=1, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._hy_z_retract_var = ctk.StringVar(value="5.0")
+        ctk.CTkEntry(setup, textvariable=self._hy_z_retract_var, width=70).grid(
+            row=1, column=1, padx=(0, 4), pady=2, sticky="w"
+        )
+        self._hy_session_info_var = ctk.StringVar(value="Session: —")
+        ctk.CTkLabel(setup, textvariable=self._hy_session_info_var,
+                     font=ctk.CTkFont(family="Courier", size=10), anchor="w",
+                     wraplength=_RIGHT_W - 40).grid(
+            row=2, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w"
+        )
+        self._hy_map_info_var = ctk.StringVar(value="z_thresh_map: 0/35 bins")
+        ctk.CTkLabel(setup, textvariable=self._hy_map_info_var,
+                     font=ctk.CTkFont(family="Courier", size=10), anchor="w").grid(
+            row=3, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w"
+        )
+
+        btn_row = ctk.CTkFrame(f, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._hy_start_btn = ctk.CTkButton(btn_row, text="Start", width=80, command=self._hy_on_start)
+        self._hy_start_btn.pack(side="left", padx=(0, 6))
+        self._hy_estop_btn = ctk.CTkButton(
+            btn_row, text="E-STOP", width=80,
+            fg_color="red", hover_color="#aa0000",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._hy_on_estop, state="disabled",
+        )
+        self._hy_estop_btn.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            btn_row, text="Return to Hub", width=110,
+            fg_color="gray40", hover_color="gray30",
+            command=self._hy_on_return_to_hub,
+        ).pack(side="left")
+
+        self._hy_progress_var = ctk.StringVar(value="")
+        ctk.CTkLabel(f, textvariable=self._hy_progress_var,
+                     font=ctk.CTkFont(family="Courier", size=10), anchor="w").pack(
+            fill="x", padx=8, pady=(2, 0)
+        )
+        self._hy_progress_bar = ctk.CTkProgressBar(f, width=_RIGHT_W - 40)
+        self._hy_progress_bar.set(0.0)
+        self._hy_progress_bar.pack(fill="x", padx=8, pady=(2, 4))
+        self._hy_done_var = ctk.StringVar(value="")
+        self._hy_done_lbl = ctk.CTkLabel(
+            f, textvariable=self._hy_done_var,
+            font=ctk.CTkFont(family="Courier", size=11), anchor="w", justify="left",
+        )
+        return f
 
     # ══════════════════════════════════════════════════════════════════════════
     # State machine
@@ -807,20 +880,21 @@ class SensitivityWindow(ctk.CTk):
         s = self._state
         v4_states = (V4_CONFIG, V4_CALIBRATING, V4_CALIBRATION_DONE,
                      V4_COLLECTING, V4_PAUSED, V4_COMPLETE)
+        st_states = (ST_PANEL_IDLE, ST_PANEL_RUNNING, ST_PANEL_DONE)
+        hy_states = (HY_PANEL_IDLE, HY_PANEL_SWEEPING, HY_PANEL_DONE)
+
         visible = {
-            self._com_section:              s == STARTUP,
-            self._detection_params_section: s >= BASELINE,
+            self._com_section:               s == STARTUP,
+            self._detection_params_section:  s >= BASELINE,
             self._scale_calibration_section: s == BASELINE,
-            self._arduino_section:          s >= BASELINE,
-            self._position_section:      s >= BASELINE,
-            self._jog_section:           s in (BASELINE, CEILING_RAMP, PAUSED) or self._in_countdown,
-            self._estop_bar:             s >= BASELINE,
-            self._ceiling_section:       s == CEILING_RAMP,
-            self._force_section:         s in (FORCE_ENTRY, GRID_RUNNING),
-            self._grid_progress_section: s in (GRID_RUNNING, PAUSED),
-            self._v4_section:            s == BASELINE or s in v4_states,
-            self._session_controls:      s in (GRID_RUNNING, PAUSED) or s in (V4_CALIBRATING, V4_COLLECTING, V4_PAUSED),
-            self._stability_section:     s >= BASELINE,
+            self._arduino_section:           s >= BASELINE,
+            self._position_section:          s >= BASELINE,
+            self._jog_section:               s in (BASELINE, HUB) or s in v4_states,
+            self._estop_bar:                 s >= BASELINE,
+            self._hub_section:               s == HUB,
+            self._v4_section:                s in v4_states,
+            self._stability_panel:           s in st_states,
+            self._hysteresis_panel:          s in hy_states,
         }
         for w in self._rp_sections:
             w.pack_forget()
@@ -828,23 +902,33 @@ class SensitivityWindow(ctk.CTk):
             if visible.get(w, False):
                 w.pack(fill="x", padx=6, pady=3)
 
-        if hasattr(self, '_pause_btn'):
-            self._pause_btn.configure( state="normal"   if s in (GRID_RUNNING, V4_CALIBRATING, V4_COLLECTING) else "disabled")
-            self._resume_btn.configure(state="normal"   if s in (PAUSED, V4_PAUSED)                   else "disabled")
-            self._abort_btn.configure( state="normal"   if s in (GRID_RUNNING, PAUSED)                else "disabled")
-        if hasattr(self, '_start_grid_btn'):
-            self._start_grid_btn.configure(state="normal" if s == FORCE_ENTRY else "disabled")
-        if hasattr(self, '_ramp_back_btn'):
-            self._ramp_back_btn.configure(
-                state="normal" if s == CEILING_RAMP and self._ramp_bin_idx == 0 else "disabled"
-            )
-        if hasattr(self, '_v4_calib_btn'):
-            self._v4_calib_btn.configure(state="normal" if s in (BASELINE, V4_CONFIG) else "disabled")
-            self._v4_load_btn.configure(state="normal" if s in (BASELINE, V4_CONFIG) else "disabled")
+        if hasattr(self, "_v4_calib_btn"):
+            self._v4_calib_btn.configure(state="normal" if s == V4_CONFIG else "disabled")
+            self._v4_load_btn.configure(state="normal" if s == V4_CONFIG else "disabled")
             self._v4_run_btn.configure(
-                state="normal" if s in (BASELINE, V4_CONFIG, V4_CALIBRATION_DONE) and self._v4_calibration_ready()
+                state="normal" if s in (V4_CONFIG, V4_CALIBRATION_DONE) and self._v4_calibration_ready()
                 else "disabled"
             )
+            self._v4_pause_btn.configure(state="normal" if s in (V4_CALIBRATING, V4_COLLECTING) else "disabled")
+            self._v4_resume_btn.configure(state="normal" if s == V4_PAUSED else "disabled")
+            self._v4_return_btn.configure(state="normal" if s in (V4_CONFIG, V4_CALIBRATION_DONE, V4_COMPLETE) else "disabled")
+
+        if hasattr(self, "_st_start_btn"):
+            self._st_start_btn.configure(state="normal" if s == ST_PANEL_IDLE else "disabled")
+            self._st_estop_btn.configure(state="normal" if s == ST_PANEL_RUNNING else "disabled")
+            self._st_again_btn.configure(state="normal" if s == ST_PANEL_DONE else "disabled")
+            if s == ST_PANEL_DONE and self._st_delta_drift_mm is not None:
+                self._st_result_lbl.pack(fill="x", padx=8, pady=(0, 6))
+            elif hasattr(self, "_st_result_lbl"):
+                self._st_result_lbl.pack_forget()
+
+        if hasattr(self, "_hy_start_btn"):
+            self._hy_start_btn.configure(state="normal" if s == HY_PANEL_IDLE else "disabled")
+            self._hy_estop_btn.configure(state="normal" if s == HY_PANEL_SWEEPING else "disabled")
+            if s == HY_PANEL_DONE:
+                self._hy_done_lbl.pack(fill="x", padx=8, pady=(0, 6))
+            elif hasattr(self, "_hy_done_lbl"):
+                self._hy_done_lbl.pack_forget()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Feed
@@ -869,9 +953,12 @@ class SensitivityWindow(ctk.CTk):
                     if self._recording_active.is_set():
                         with self._frame_lock:
                             self._frame_buffer.append((records, pos_ms))
-                    session_active = self._state in (GRID_RUNNING, PAUSED)
-                    annotated = draw_overlay(self._tracker.last_undistorted, records,
-                                             session_active, self._tracker.frame_index)
+                    v4_running = self._state in (V4_CALIBRATING, V4_COLLECTING)
+                    last_und = self._tracker.last_undistorted
+                    annotated = draw_overlay(
+                        last_und if last_und is not None else self._tracker.undistort(frame),
+                        records, v4_running, self._tracker.frame_index,
+                    )
                 else:
                     annotated = self._tracker.undistort(frame)
                 self._last_annotated = annotated
@@ -1118,30 +1205,12 @@ class SensitivityWindow(ctk.CTk):
             msg += "  [WARNING: expected ~154]"
         self._jog_status_lbl.configure(text=msg)
 
-        if self._resume_checkpoint:
-            # Pre-fill per-bin calibration from checkpoint and skip the ramp
-            # sequence entirely — calibration is always complete before any
-            # measurement bin starts, so go straight to GRID_RUNNING.
-            self._bin_force_levels = {
-                int(bid): [(lbl, v["force_n"], v["z_mm"]) for lbl, v in levels.items()]
-                for bid, levels in self._resume_checkpoint["bin_force_levels"].items()
-            }
-            self._current_bin_idx = self._resume_checkpoint["last_completed_bin"]
-            self._last_completed_bin_id = self._resume_checkpoint["last_completed_bin"]
-            self._launch_grid()
-        elif self._v4_resume_checkpoint:
+        if self._v4_resume_checkpoint:
             self._resume_v4_session()
-        elif self._v4_enabled_var.get():
-            # Operator opted into the v4 protocol — stay in BASELINE/V4_CONFIG
-            # so the "Sensitivity v4" controls (Calibration / Run Sensitivity /
-            # Load Calibration) drive the flow instead of the v3 ceiling ramp.
-            self._set_state(V4_CONFIG)
-            self._status_var.set(
-                "STATE: V4_CONFIG — set Blend ID / params, then Calibration or Load Calibration"
-            )
         else:
-            self._ramp_bin_idx = 0
-            self._begin_ceiling_ramp()
+            self._hy_map_info_var.set(f"z_thresh_map: {len(self._v4_z_thresh_map)}/35 bins")
+            self._hy_session_info_var.set(f"Session: {self._session_dir or '—'}")
+            self._set_state(HUB)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Jog panel
@@ -1178,466 +1247,44 @@ class SensitivityWindow(ctk.CTk):
         self._ender_cmd_q.put(("async", "send_command", ("G91",)))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # CEILING_RAMP handlers
+    # v4 pause / resume / E-Stop
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _on_mass_fmax_changed(self, *_) -> None:
-        try:
-            mass_g = float(self._mass_fmax_var.get())
-            f_max_n = (mass_g / 1000.0) * _GRAVITY_MPS2
-            self._fmax_n_var.set(f"{f_max_n:.4f}")
-            self._fthr_var.set(f"{0.90 * f_max_n:.4f}")
-            self._mass_fthr_var.set(f"{0.90 * mass_g:.4f}")
-        except ValueError:
-            self._fmax_n_var.set("—")
-            self._fthr_var.set("—")
-            self._mass_fthr_var.set("—")
+    def _on_v4_pause(self) -> None:
+        self._pause_event.set()
+        self._set_state(V4_PAUSED)
+        self._status_var.set("STATE: V4_PAUSED — finishing current step, then paused")
 
-    def _on_confirm_ceiling(self) -> None:
-        try:
-            mass_fmax_g = float(self._mass_fmax_var.get())
-            z_thr = float(self._zthr_var.get())
-        except ValueError:
-            messagebox.showerror("Input Error", "F_max and z_threshold must be numbers.")
-            return
-        if mass_fmax_g <= 0 or z_thr >= 0:
-            messagebox.showerror(
-                "Input Error",
-                "F_max must be > 0 and z_threshold must be negative "
-                "(indentation moves toward negative Z from the captured zero).",
-            )
-            return
-        f_max = (mass_fmax_g / 1000.0) * _GRAVITY_MPS2
-        self._f_max       = f_max
-        self._f_threshold = 0.90 * f_max
-        self._z_threshold = z_thr
-        bin_id = self._bin_positions[self._ramp_bin_idx][0]
-        self._bin_force_levels[bin_id] = self._compute_force_levels()
-        self._populate_force_display()
-        self._set_state(FORCE_ENTRY)
-
-    def _on_ramp_back_to_baseline(self) -> None:
-        """Recover from accidentally entering the v3 ceiling ramp (e.g.
-        forgetting to check 'Use v4 protocol' before Capture Baseline). Only
-        reachable at ramp 1 before any bin has been confirmed — retracts the
-        indenter to clearance (same justification as _begin_ceiling_ramp's
-        opening retract, ui/sensitivity_window.py:1064-1067) and returns to
-        BASELINE so the operator can flip the checkbox and recapture."""
+    def _on_v4_resume(self) -> None:
         self._ender_sync_cmd("G90", timeout=10.0)
-        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=10.0)
-        self._ender_sync_cmd("M400")
-        self._ender_z = _CLEARANCE_Z_MM
-        self._update_ender_pos_display()
-        self._ramp_bin_idx = 0
-        self._ramp_var.set("Ramp:  — / 9")
-        self._set_state(BASELINE)
-        self._status_var.set(
-            "STATE: BASELINE — check 'Use v4 protocol' if needed, then Capture Baseline"
-        )
-
-    def _compute_force_levels(self) -> list[tuple[str, float, float]]:
-        levels = []
-        for i, frac in enumerate([0.25, 0.50, 0.75, 1.00]):
-            force_n = frac * self._f_threshold
-            z_mm    = (force_n / self._f_threshold) * self._z_threshold
-            levels.append((f"L{i + 1}", force_n, z_mm))
-        return levels
-
-    def _populate_force_display(self) -> None:
-        bin_id = self._bin_positions[self._ramp_bin_idx][0]
-        for i, (label, force_n, z_mm) in enumerate(self._bin_force_levels[bin_id]):
-            self._level_vars[i].set(f"{label}: {force_n:.4f} N  |  Z: {z_mm:.3f} mm")
-        is_last = self._ramp_bin_idx == len(self._bin_positions) - 1
-        self._start_grid_btn.configure(text="Start Grid" if is_last else "Next Position")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # CEILING_RAMP loop — one ramp per grid position
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _begin_ceiling_ramp(self) -> None:
-        bin_id, x_mm, y_mm = self._bin_positions[self._ramp_bin_idx]
-        n = len(self._bin_positions)
-
-        # Force absolute mode FIRST — the operator just jogged Z down with the
-        # relative-mode jog buttons (move_axis sends G91 and never restores
-        # G90), so without this the retraction below would be interpreted as
-        # a relative +3mm nudge from the pressed-in position, not an absolute
-        # move to clearance height.
-        self._ender_sync_cmd("G90", timeout=10.0)
-
-        # Retract to clearance before any XY travel — the operator just jogged
-        # Z down to find F_threshold, so the indenter may still be pressed
-        # into the elastomer. Without this it would drag across the surface
-        # while moving to the next bin's centroid.
-        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=10.0)
-        self._ender_sync_cmd("M400")
-        self._ender_z = _CLEARANCE_Z_MM
-        self._update_ender_pos_display()
-
-        # Move indenter to this bin's centroid before the operator ramps —
-        # F_max/z_threshold are local to each position (proximity to the
-        # rigid support edges changes how much force the elastomer tolerates).
-        self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000")
-        self._ender_sync_cmd("M400")
-        self._ender_x, self._ender_y = x_mm, y_mm
-        self._update_ender_pos_display()
-
-        # Descend back to the origin contact-height reference (Z=0) so the
-        # operator starts every bin's manual ramp-down from the same known
-        # height, rather than from +3mm clearance.
-        self._ender_sync_cmd("G1 Z0.000 F300", timeout=10.0)
-        self._ender_sync_cmd("M400")
-        self._ender_z = 0.0
-        self._update_ender_pos_display()
-
-        self._mass_fmax_var.set("")
-        self._zthr_var.set("")
-        self._fmax_n_var.set("—")
-        self._fthr_var.set("—")
-        self._mass_fthr_var.set("—")
-        self._ramp_var.set(
-            f"Ramp {self._ramp_bin_idx + 1} / {n}  —  Bin {bin_id}  "
-            f"(X {x_mm:.3f}, Y {y_mm:.3f})"
-        )
-        self._set_state(CEILING_RAMP)
-        self._status_var.set(
-            f"STATE: CEILING_RAMP — ramp {self._ramp_bin_idx + 1}/{n} "
-            f"at bin {bin_id} (X {x_mm:.3f}, Y {y_mm:.3f})"
-        )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # FORCE_ENTRY — advance ramp sequence or start grid
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _on_start_grid(self) -> None:
-        if self._ramp_bin_idx < len(self._bin_positions) - 1:
-            self._ramp_bin_idx += 1
-            self._begin_ceiling_ramp()
-            return
-        self._launch_grid()
-
-    def _launch_grid(self) -> None:
-        if self._resume_checkpoint:
-            self._session_dir = self._resume_checkpoint["session_dir"]
-            self._session_ts  = self._resume_checkpoint["session_ts"]
-            self._writer = SensitivityWriter(
-                self._session_dir, csv_path=self._resume_checkpoint["csv_path"]
-            )
-            self._resume_checkpoint = None
-        else:
-            self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._session_dir = os.path.join("output", "sessions",
-                                             f"{self._session_ts}_sensitivity")
-            self._writer = SensitivityWriter(self._session_dir)
-
-        # Baseline is always recaptured immediately before _launch_grid runs
-        # (see _on_capture_baseline), so this reflects the markers' current
-        # physical layout for this run -- write/overwrite unconditionally.
-        write_marker_baselines(self._session_dir, self._session_ts,
-                               self._tracker.baseline_positions_mm)
-
-        self._session_start_t = time.time()
         self._pause_event.clear()
         self._stop_event.clear()
+        if self._v4_phase == "calibration":
+            self._set_state(V4_CALIBRATING)
+            self._status_var.set("STATE: V4_CALIBRATING — resumed")
+            self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
+        else:
+            self._set_state(V4_COLLECTING)
+            self._status_var.set("STATE: V4_COLLECTING — resumed")
+            self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
+        self._v4_thread.start()
 
-        # Ensure absolute positioning mode
+    def _v4_on_return_to_hub(self) -> None:
+        threading.Thread(target=self._do_return_to_hub, daemon=True).start()
+
+    def _do_return_to_hub(self) -> None:
         self._ender_sync_cmd("G90", timeout=10.0)
-
-        self._set_state(GRID_RUNNING)
-        self._grid_thread = threading.Thread(target=self._grid_loop, daemon=True)
-        self._grid_thread.start()
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Grid loop (background thread)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _grid_loop(self) -> None:
-        total_bins   = len(self._bin_positions)
-        skip_entry   = self._skip_bin_entry
-        self._skip_bin_entry = False
-
-        # Retract to clearance before any XY travel — also re-establishes a
-        # known Z relative to the captured G92 zero when resuming.
-        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
-        self._ender_sync_cmd("M400")
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
+        self._ender_sync_cmd("M400", timeout=30.0)
+        self._ender_sync_cmd("G1 X0 Y0 F3000", timeout=30.0)
+        self._ender_sync_cmd("M400", timeout=30.0)
         self._ender_z = _CLEARANCE_Z_MM
+        self._ender_x = 0.0
+        self._ender_y = 0.0
         self.after(0, self._update_ender_pos_display)
-
-        for bin_entry in self._bin_positions[self._current_bin_idx:]:
-            bin_id, x_mm, y_mm = bin_entry
-
-            if self._pause_event.is_set() or self._stop_event.is_set():
-                break
-
-            if skip_entry:
-                skip_entry = False
-            else:
-                # 1. Move XY to bin (coordinates are relative to G92 origin)
-                self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000")
-                self._ender_sync_cmd("M400")
-                self._ender_x, self._ender_y = x_mm, y_mm
-                self.after(0, self._update_ender_pos_display)
-
-                if self._pause_event.is_set() or self._stop_event.is_set():
-                    break
-
-                # 2. 30-second inter-bin rest with countdown and frozen feed
-                self.after(0, self._show_jog_for_countdown)
-                self._do_countdown(30, bin_id, total_bins)
-                self.after(0, self._hide_jog_after_countdown)
-
-                if self._pause_event.is_set() or self._stop_event.is_set():
-                    break
-
-            # 3. Reps
-            rep_start = self._current_rep
-            for rep in range(rep_start, 11):
-                if self._pause_event.is_set() or self._stop_event.is_set():
-                    self._current_rep = rep
-                    break
-
-                bin_levels = self._bin_force_levels[bin_id]
-                lev_start = self._current_level_idx if rep == rep_start else 0
-                for lev_idx in range(lev_start, len(bin_levels)):
-                    if self._pause_event.is_set() or self._stop_event.is_set():
-                        self._current_rep       = rep
-                        self._current_level_idx = lev_idx
-                        break
-
-                    label, force_n, z_target = bin_levels[lev_idx]
-
-                    # 4. Move Z to target
-                    self._ender_sync_cmd(f"G1 Z{z_target:.3f} F300")
-                    self._ender_sync_cmd("M400")
-                    self._ender_z = z_target
-                    self.after(0, self._update_ender_pos_display)
-
-                    if self._stop_event.is_set():
-                        self._current_rep       = rep
-                        self._current_level_idx = lev_idx
-                        break
-
-                    # 4b. Let the indenter settle at target Z before recording —
-                    # avoids capturing ramp-up frames from the move itself.
-                    time.sleep(_Z_SETTLE_S)
-                    if self._stop_event.is_set():
-                        self._current_rep       = rep
-                        self._current_level_idx = lev_idx
-                        break
-
-                    # 5. Record 30 frames
-                    self._record_window(bin_id, x_mm, y_mm, rep, label, force_n, total_bins)
-
-                    # Advance level index (cleared to 0 when rep changes)
-                    self._current_level_idx = lev_idx + 1
-
-                if self._pause_event.is_set() or self._stop_event.is_set():
-                    break
-
-                # 6. Retract to clearance after all levels in this rep
-                self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
-                self._ender_sync_cmd("M400")
-                self._ender_z = _CLEARANCE_Z_MM
-                self.after(0, self._update_ender_pos_display)
-                self._current_level_idx = 0
-
-            if self._pause_event.is_set() or self._stop_event.is_set():
-                # Retract to clearance before pausing
-                self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
-                self._ender_z = _CLEARANCE_Z_MM
-                self.after(0, self._update_ender_pos_display)
-                break
-
-            # 7. Flush CSV and write checkpoint
-            if self._writer:
-                self._writer.flush_bin()
-            self._last_completed_bin_id = bin_id
-            self._checkpoint.save(
-                session_dir=self._session_dir,
-                session_ts=self._session_ts,
-                last_completed_bin=bin_id,
-                bin_force_levels={
-                    bid: {lbl: {"force_n": fn, "z_mm": zm} for lbl, fn, zm in levels}
-                    for bid, levels in self._bin_force_levels.items()
-                },
-                csv_path=self._writer.csv_path if self._writer else "",
-            )
-            self._current_bin_idx += 1
-            self._current_rep       = 1
-            self._current_level_idx = 0
-
-        # Grid finished or stopped
-        if not self._pause_event.is_set() and not self._stop_event.is_set():
-            if self._writer:
-                self._writer.close()
-                self._writer = None
-            self.after(0, lambda: self._set_state(COMPLETE))
-            self.after(0, lambda: self._status_var.set("STATE: COMPLETE — session saved"))
-
-    def _record_window(
-        self,
-        bin_id: int, x_mm: float, y_mm: float,
-        rep: int, label: str, force_n: float,
-        total_bins: int,
-    ) -> None:
-        with self._frame_lock:
-            self._frame_buffer.clear()
-        self._recording_active.set()
-
-        deadline = time.time() + 15.0
-        while True:
-            with self._frame_lock:
-                n = len(self._frame_buffer)
-            self.after(0, lambda _n=n, _b=bin_id, _tb=total_bins, _r=rep, _l=label, _f=force_n:
-                       self._update_grid_labels(_b, _tb, _r, _l, _f, _n))
-            if n >= 30 or self._stop_event.is_set() or time.time() > deadline:
-                break
-            time.sleep(0.005)
-
-        self._recording_active.clear()
-        if self._stop_event.is_set():
-            return
-
-        with self._frame_lock:
-            frames = list(self._frame_buffer[:30])
-        if self._writer:
-            for frame_idx, (records, ts) in enumerate(frames):
-                self._writer.buffer_frame(
-                    records, frame_idx, ts,
-                    bin_id, x_mm, y_mm, rep, label, force_n,
-                )
-
-    def _do_countdown(self, seconds: int, bin_id: int, total_bins: int) -> None:
-        self.after(0, lambda: setattr(self, '_feed_frozen', True))
-        for s in range(seconds, 0, -1):
-            if self._pause_event.is_set() or self._stop_event.is_set():
-                break
-            elapsed_s = int(time.time() - self._session_start_t)
-            h, rem = divmod(elapsed_s, 3600)
-            m, sec = divmod(rem, 60)
-            self.after(0, lambda _s=s, _b=bin_id, _tb=total_bins, _h=h, _m=m, _sec=sec: (
-                self._grid_bin_var.set(f"Bin:   {_b} / {_tb}"),
-                self._grid_rest_var.set(f"Next bin in: {_s} s"),
-                self._grid_elapsed_var.set(f"Elapsed: {_h:02d}:{_m:02d}:{_sec:02d}"),
-            ))
-            time.sleep(1)
-        self.after(0, lambda: setattr(self, '_feed_frozen', False))
-        self.after(0, lambda: self._grid_rest_var.set(""))
-
-    def _show_jog_for_countdown(self) -> None:
-        self._in_countdown = True
-        self._apply_visibility()
-
-    def _hide_jog_after_countdown(self) -> None:
-        self._in_countdown = False
-        if self._state == GRID_RUNNING:
-            self._apply_visibility()
-
-    def _update_grid_labels(
-        self, bin_id: int, total_bins: int, rep: int,
-        label: str, force_n: float, frame: int,
-    ) -> None:
-        elapsed_s = int(time.time() - self._session_start_t)
-        h, rem = divmod(elapsed_s, 3600)
-        m, s   = divmod(rem, 60)
-        self._grid_bin_var.set(   f"Bin:   {bin_id} / {total_bins}")
-        self._grid_rep_var.set(   f"Rep:   {rep} / 10")
-        self._grid_level_var.set( f"Force: {label}  ({force_n:.4f} N)")
-        self._grid_frame_var.set( f"Frame: {frame} / 30")
-        self._grid_elapsed_var.set(f"Elapsed: {h:02d}:{m:02d}:{s:02d}")
-        self._status_var.set(
-            f"STATE: GRID_RUNNING | Bin {bin_id}/{total_bins} | Rep {rep}/10 | {label} | Frame {frame}/30"
-        )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # GRID_RUNNING / PAUSED controls
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _on_pause(self) -> None:
-        self._pause_event.set()
-        if self._state in (V4_CALIBRATING, V4_COLLECTING):
-            self._set_state(V4_PAUSED)
-            self._status_var.set("STATE: V4_PAUSED — finishing current step, then paused")
-        else:
-            self._set_state(PAUSED)
-            self._status_var.set("STATE: PAUSED — finishing current window, then stopped")
-
-    def _on_resume(self) -> None:
-        # Re-assert absolute mode before resuming grid / v4 loops
-        self._ender_sync_cmd("G90", timeout=10.0)
-
-        if self._state == V4_PAUSED:
-            self._pause_event.clear()
-            self._stop_event.clear()
-            if self._v4_phase == "calibration":
-                self._set_state(V4_CALIBRATING)
-                self._status_var.set("STATE: V4_CALIBRATING — resumed")
-                self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
-            else:
-                self._set_state(V4_COLLECTING)
-                self._status_var.set("STATE: V4_COLLECTING — resumed")
-                self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
-            self._v4_thread.start()
-            return
-
-        self._skip_bin_entry = (self._current_rep > 1 or self._current_level_idx > 0)
-        self._pause_event.clear()
-        self._stop_event.clear()
-        self._set_state(GRID_RUNNING)
-        self._grid_thread = threading.Thread(target=self._grid_loop, daemon=True)
-        self._grid_thread.start()
-
-    def _on_abort(self) -> None:
-        if not messagebox.askyesno("Abort Session",
-                                   "Abort the session?\nCheckpoint and partial CSV will be saved."):
-            return
-        self._stop_event.set()
-        self._pause_event.set()
-        if self._grid_thread and self._grid_thread.is_alive():
-            self._grid_thread.join(timeout=8.0)
-        if self._writer:
-            self._writer.discard_bin()
-            self._writer.close()
-            # Save checkpoint pointing to last FULLY completed bin
-            self._checkpoint.save(
-                session_dir=self._session_dir,
-                session_ts=self._session_ts,
-                last_completed_bin=self._last_completed_bin_id,
-                bin_force_levels={
-                    bid: {lbl: {"force_n": fn, "z_mm": zm} for lbl, fn, zm in levels}
-                    for bid, levels in self._bin_force_levels.items()
-                },
-                csv_path=self._writer.csv_path,
-            )
-            self._writer = None
-
-        # Reset grid bookkeeping so a fresh grid run starts clean from bin 1
-        self._current_bin_idx = 0
-        self._current_rep = 1
-        self._current_level_idx = 0
-        self._last_completed_bin_id = 0
-        self._skip_bin_entry = False
-
-        # Reset session output bookkeeping
-        self._session_dir = ""
-        self._session_ts = ""
-        self._resume_checkpoint = None
-
-        # Clear ceiling/force params — operator re-measures every position
-        self._f_max = self._f_threshold = self._z_threshold = 0.0
-        self._bin_force_levels = {}
-        self._ramp_bin_idx = 0
-        for i, v in enumerate(self._level_vars):
-            v.set(f"L{i + 1}: — N  |  Z: — mm")
-
-        self._begin_ceiling_ramp()
-        self._status_var.set(
-            "STATE: CEILING_RAMP — aborted; baseline retained, "
-            "re-measure every position to restart"
-        )
+        self.after(0, lambda: self._set_state(HUB))
 
     def _on_estop(self) -> None:
-        # Bypass queue — write M112 directly for immediate effect
         if self._ender_controller and self._ender_controller.ser \
                 and self._ender_controller.ser.is_open:
             try:
@@ -1646,16 +1293,15 @@ class SensitivityWindow(ctk.CTk):
                 pass
         self._stop_event.set()
         self._pause_event.set()
+        self._st_stop_ev.set()
+        self._hy_stop_ev.set()
         if self._state in (V4_CALIBRATING, V4_COLLECTING):
             self._set_state(V4_PAUSED)
             self._status_var.set(
                 "STATE: V4_PAUSED — E-STOP sent. Fix issue, then Resume (G90 re-sent on resume)."
             )
         else:
-            self._set_state(PAUSED)
-            self._status_var.set(
-                "STATE: PAUSED — E-STOP sent. Fix issue, then Resume (G90 re-sent on resume)."
-            )
+            self._status_var.set("E-STOP sent.")
 
     def _on_ender_reset(self) -> None:
         if not self._ender_connected:
@@ -1698,26 +1344,6 @@ class SensitivityWindow(ctk.CTk):
         self._arduino_log = self._arduino_log[-10:]
         self._arduino_log_var.set("\n".join(self._arduino_log))
         self._arduino_entry.delete(0, "end")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Resume flow
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _check_for_resume(self) -> None:
-        cp = self._checkpoint.scan_for_resume()
-        if cp is None:
-            return
-        ts   = cp.get("session_ts", "unknown")
-        last = cp.get("last_completed_bin", 0)
-        if messagebox.askyesno(
-            "Resume Session",
-            f"Incomplete session found:\n  Timestamp: {ts}\n"
-            f"  Last completed bin: {last}/9\n\nResume this session?",
-        ):
-            self._resume_checkpoint = cp
-            self._status_var.set(
-                f"STATE: STARTUP — will resume session {ts} from bin {last + 1}"
-            )
 
     # ══════════════════════════════════════════════════════════════════════════
     # v4 — small helpers
@@ -2583,21 +2209,630 @@ class SensitivityWindow(ctk.CTk):
             plt.close(fig)
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Stability panel — message queue poller
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _poll_st_msg_q(self) -> None:
+        try:
+            while True:
+                key, value = self._st_msg_q.get_nowait()
+                if key == "set_state" and isinstance(value, int):
+                    self._st_state = value
+                    self._set_state(value)
+                elif key == "progress":
+                    self._st_progress_var.set(str(value))
+                elif key == "update_plot" and isinstance(value, list):
+                    self._st_render_plot(value)
+                elif key == "status":
+                    self._status_var.set(str(value))
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_st_msg_q)
+
+    def _st_post(self, key: str, value: object) -> None:
+        self._st_msg_q.put((key, value))
+
+    def _st_on_browse(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Select session folder containing z_thresh_map.json"
+        )
+        if folder:
+            self._st_folder_var.set(folder)
+            self._st_try_load_z_thresh_map(folder, self._st_blend_var.get().strip())
+
+    def _st_try_load_z_thresh_map(self, folder: str, blend_id: str) -> bool:
+        if not folder or not os.path.isdir(folder):
+            return False
+        candidates: list[str] = []
+        if blend_id:
+            candidates.append(os.path.join(folder, f"z_thresh_map_{blend_id}.json"))
+        candidates.append(os.path.join(folder, "z_thresh_map.json"))
+        for g in os.listdir(folder):
+            if g.startswith("z_thresh_map") and g.endswith(".json"):
+                candidates.append(os.path.join(folder, g))
+        import json as _json
+        data = None
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    with open(path) as fh:
+                        data = _json.load(fh)
+                    data["bins"] = {int(k): v for k, v in data.get("bins", {}).items()}
+                    break
+                except Exception:
+                    continue
+        if data is None:
+            self._st_z_thresh_info_var.set("z_thresh: — (not found)")
+            return False
+        bins = data.get("bins", {})
+        entry = bins.get(_ST_CENTER_BIN_ID)
+        if entry is None:
+            entry = min(bins.values(),
+                        key=lambda b: b.get("x_mm", 99)**2 + b.get("y_mm", 99)**2,
+                        default=None)
+        if entry is None:
+            self._st_z_thresh_info_var.set("z_thresh: — (no bins in map)")
+            return False
+        self._st_z_thresh_mm = float(entry["z_thresh_mm"])
+        self._st_z_thresh_info_var.set(
+            f"z_thresh: {self._st_z_thresh_mm:.3f} mm  (bin {_ST_CENTER_BIN_ID})"
+        )
+        return True
+
+    def _st_on_start(self) -> None:
+        blend_id = self._st_blend_var.get().strip()
+        folder   = self._st_folder_var.get().strip()
+        if not blend_id:
+            messagebox.showerror("Input Error", "Blend ID is required.")
+            return
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Input Error", "Select a valid session folder.")
+            return
+        if not self._st_try_load_z_thresh_map(folder, blend_id):
+            messagebox.showerror("Missing File",
+                                 "z_thresh_map not found in the selected folder.")
+            return
+        if not self._tracker.baseline_set:
+            messagebox.showerror("No Baseline",
+                                 "Capture Baseline before running the stability test.")
+            return
+        self._st_blend_id = blend_id
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.join("output", "sessions", f"{ts}_{blend_id}_stability")
+        self._st_session_dir = out_dir
+        self._st_writer = StabilityWriter(out_dir)
+        self._st_hold_means = []
+        self._st_drift_0s_mm = None
+        self._st_drift_3s_mm = None
+        self._st_delta_drift_mm = None
+        self._st_drift_rate_mm_per_s = None
+        self._st_stop_ev.clear()
+        self._st_state = ST_PANEL_RUNNING
+        self._set_state(ST_PANEL_RUNNING)
+        self._st_worker = threading.Thread(target=self._st_worker_fn, daemon=True)
+        self._st_worker.start()
+
+    def _st_worker_fn(self) -> None:
+        self._st_post("status", "Checking baseline (60 frames)…")
+        baseline_ok = False
+        mean_abs = float("nan")
+        for attempt in range(2):
+            frames = self._st_collect_frames(_ST_BASELINE_FRAMES, timeout_s=10.0)
+            if frames is None:
+                return
+            mean_abs = self._st_mean_abs_delta_z(frames)
+            if mean_abs < _ST_BASELINE_GATE_MM:
+                baseline_ok = True
+                break
+            if attempt == 0:
+                self._st_post("status",
+                    f"Baseline check failed (mean={mean_abs:.4f} mm) — waiting 5 s, retrying…")
+                for _ in range(50):
+                    if self._st_stop_ev.is_set():
+                        return
+                    time.sleep(0.1)
+        if not baseline_ok:
+            self._st_post("status",
+                f"Baseline check failed (mean={mean_abs:.4f} mm) — aborting.")
+            self._st_post("set_state", ST_PANEL_IDLE)
+            return
+
+        self._st_post("status", f"Pressing to Z={self._st_z_thresh_mm:.3f} mm…")
+        self._ender_sync_cmd("G90", timeout=10.0)
+        self._ender_sync_cmd(f"G1 Z{self._st_z_thresh_mm:.3f} F300", timeout=60.0)
+        self._ender_sync_cmd("M400", timeout=60.0)
+        if self._st_stop_ev.is_set():
+            self._st_do_retract()
+            return
+
+        self._st_post("status", "Settling…")
+        for remaining in range(_ST_SETTLE_FRAMES, 0, -1):
+            if self._st_stop_ev.is_set():
+                self._st_do_retract()
+                return
+            self._st_post("progress", f"Settling…  {remaining} frames remaining")
+            time.sleep(1.0 / _ST_FPS)
+        self._st_collect_frames(_ST_SETTLE_FRAMES, timeout_s=10.0)
+        if self._st_stop_ev.is_set():
+            self._st_do_retract()
+            return
+
+        self._st_post("progress", f"Holding — 0 / {_ST_HOLD_FRAMES} frames")
+        with self._frame_lock:
+            self._frame_buffer.clear()
+        self._recording_active.set()
+        frames_written = 0
+        while frames_written < _ST_HOLD_FRAMES and not self._st_stop_ev.is_set():
+            deadline_bt = time.time() + 3.0
+            while True:
+                with self._frame_lock:
+                    n_buf = len(self._frame_buffer)
+                avail = n_buf - frames_written
+                if (avail >= 30 or frames_written + avail >= _ST_HOLD_FRAMES
+                        or self._st_stop_ev.is_set() or time.time() > deadline_bt):
+                    break
+                time.sleep(0.005)
+            with self._frame_lock:
+                batch_end = min(len(self._frame_buffer), _ST_HOLD_FRAMES)
+                batch = list(self._frame_buffer[frames_written:batch_end])
+            for records, _ in batch:
+                if self._st_stop_ev.is_set():
+                    break
+                if self._st_writer is not None:
+                    ma = self._st_writer.write_frame(frames_written, records)
+                    self._st_hold_means.append(ma)
+                frames_written += 1
+            self._st_post("progress", f"Holding — {frames_written} / {_ST_HOLD_FRAMES} frames")
+            self._st_post("update_plot", list(self._st_hold_means))
+        self._recording_active.clear()
+
+        if self._st_stop_ev.is_set():
+            self._st_do_retract()
+            self._st_post("status", "E-STOP — partial data saved.")
+            self._st_finalize(aborted=True)
+            return
+
+        self._st_do_retract()
+        self._st_collect_frames(1, timeout_s=5.0)
+        if self._st_writer is not None:
+            self._st_writer.close()
+        self._st_finalize(aborted=False)
+
+    def _st_collect_frames(
+        self, n: int, timeout_s: float = 10.0,
+    ) -> list[tuple[list[MarkerRecord], float]] | None:
+        with self._frame_lock:
+            self._frame_buffer.clear()
+        self._recording_active.set()
+        deadline = time.time() + timeout_s
+        while True:
+            with self._frame_lock:
+                count = len(self._frame_buffer)
+            if count >= n or self._st_stop_ev.is_set() or time.time() > deadline:
+                break
+            time.sleep(0.005)
+        self._recording_active.clear()
+        if self._st_stop_ev.is_set():
+            return None
+        with self._frame_lock:
+            return list(self._frame_buffer[:n])
+
+    def _st_mean_abs_delta_z(self, frames: list[tuple[list[MarkerRecord], float]]) -> float:
+        values: list[float] = []
+        for records, _ in frames:
+            for r in records:
+                if not r.autofilled:
+                    values.append(abs(r.delta_z_mm))
+        return sum(values) / len(values) if values else float("nan")
+
+    def _st_do_retract(self) -> None:
+        self._st_post("status", "Retracting…")
+        self._ender_sync_cmd("G90", timeout=10.0)
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
+        self._ender_sync_cmd("M400", timeout=30.0)
+
+    def _st_finalize(self, aborted: bool) -> None:
+        self._st_drift_0s_mm = None
+        self._st_drift_3s_mm = None
+        self._st_delta_drift_mm = None
+        self._st_drift_rate_mm_per_s = None
+        if self._st_hold_means:
+            arr = np.array(self._st_hold_means, dtype=float)
+            n = len(arr)
+            if n >= 30:
+                self._st_drift_0s_mm = float(np.nanmean(arr[0:30]))
+            if n >= 105:
+                self._st_drift_3s_mm = float(np.nanmean(arr[75:105]))
+            elif n > 75:
+                self._st_drift_3s_mm = float(np.nanmean(arr[75:]))
+            if self._st_drift_0s_mm is not None and self._st_drift_3s_mm is not None:
+                self._st_delta_drift_mm = abs(self._st_drift_3s_mm - self._st_drift_0s_mm)
+            if n >= 60:
+                t_arr = np.arange(n) / _ST_FPS
+                valid = ~np.isnan(arr)
+                if valid.sum() >= 60:
+                    coeffs = np.polyfit(t_arr[valid], arr[valid], 1)
+                    self._st_drift_rate_mm_per_s = float(coeffs[0])
+
+        if self._st_writer is not None and not aborted:
+            write_stability_summary_partial(
+                session_dir=self._st_session_dir,
+                blend=self._st_blend_id,
+                session_ts=self._st_writer.ts,
+                z_thresh_mm=self._st_z_thresh_mm,
+                settle_frames_discarded=_ST_SETTLE_FRAMES,
+                drift_0s_mm=self._st_drift_0s_mm,
+                drift_3s_mm=self._st_drift_3s_mm,
+                delta_drift_mm=self._st_delta_drift_mm,
+                drift_rate_mm_per_s=self._st_drift_rate_mm_per_s,
+            )
+
+        if self._st_delta_drift_mm is not None:
+            d0  = self._st_drift_0s_mm or float("nan")
+            d3  = self._st_drift_3s_mm or float("nan")
+            dd  = self._st_delta_drift_mm
+            rate = self._st_drift_rate_mm_per_s
+            rate_str = f"{rate:+.4f} mm/s" if rate is not None else "—"
+            self._st_drift_var.set(
+                f"delta_drift = {dd:.4f} mm\n"
+                f"drift_0s = {d0:.4f} mm   drift_3s = {d3:.4f} mm\n"
+                f"drift_rate = {rate_str}"
+            )
+        else:
+            self._st_drift_var.set("Insufficient hold data for drift computation.")
+
+        self._st_post("update_plot", list(self._st_hold_means))
+        self._st_post("set_state", ST_PANEL_DONE)
+
+    def _st_render_plot(self, means: list[float]) -> None:
+        if not means:
+            return
+        fig, ax = plt.subplots(figsize=(_ST_PLOT_W_PX / 100, _ST_PLOT_H_PX / 100), dpi=100)
+        t_ax = [i / _ST_FPS for i in range(len(means))]
+        ax.plot(t_ax, means, linewidth=0.8, color="#4a90d9")
+        ax.set_xlabel("t (s)", fontsize=8)
+        ax.set_ylabel("mean |Δz| (mm)", fontsize=8)
+        ax.set_xlim(0, _ST_HOLD_FRAMES / _ST_FPS)
+        ax.tick_params(labelsize=7)
+        ax.set_title("Marker stability — mean |Δz| during hold", fontsize=8)
+        fig.tight_layout(pad=0.4)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        img = Image.open(buf)
+        photo = ImageTk.PhotoImage(img)
+        self._st_plot_photo = photo
+        self._st_plot_label.configure(image=photo, text="")
+
+    def _st_on_estop(self) -> None:
+        if self._ender_controller and self._ender_controller.ser \
+                and self._ender_controller.ser.is_open:
+            try:
+                self._ender_controller.ser.write(b"M112\n")
+            except Exception:
+                pass
+        self._st_stop_ev.set()
+        self._st_post("status", "E-STOP sent — test aborted")
+
+    def _st_on_run_another(self) -> None:
+        self._st_hold_means = []
+        self._st_drift_0s_mm = None
+        self._st_drift_3s_mm = None
+        self._st_delta_drift_mm = None
+        self._st_drift_rate_mm_per_s = None
+        self._st_plot_label.configure(image="", text="")
+        self._st_plot_photo = None
+        self._st_progress_var.set("")
+        self._st_drift_var.set("")
+        self._st_blend_var.set("")
+        self._st_folder_var.set("")
+        self._st_z_thresh_info_var.set("z_thresh: —")
+        self._st_writer = None
+        self._st_stop_ev.clear()
+        self._st_state = ST_PANEL_IDLE
+        self._set_state(ST_PANEL_IDLE)
+
+    def _st_on_return_to_hub(self) -> None:
+        if self._st_state == ST_PANEL_RUNNING:
+            messagebox.showwarning("Test Running", "Stop the stability test first.")
+            return
+        threading.Thread(target=self._do_return_to_hub, daemon=True).start()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Hysteresis panel — message queue poller + worker
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _poll_hy_msg_q(self) -> None:
+        try:
+            while True:
+                key, value = self._hy_msg_q.get_nowait()
+                if key == "set_state" and isinstance(value, int):
+                    self._hy_state = value
+                    self._set_state(value)
+                elif key == "progress":
+                    self._hy_progress_var.set(str(value))
+                elif key == "progress_frac" and isinstance(value, float):
+                    self._hy_progress_bar.set(value)
+                elif key == "done_text":
+                    self._hy_done_var.set(str(value))
+                elif key == "status":
+                    self._status_var.set(str(value))
+                elif key == "warn_dialog":
+                    messagebox.showwarning("Tracking Loss", str(value))
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_hy_msg_q)
+
+    def _hy_post(self, key: str, value: object) -> None:
+        self._hy_msg_q.put((key, value))
+
+    def _hy_on_start(self) -> None:
+        blend_id = self._hy_blend_var.get().strip()
+        if not blend_id:
+            messagebox.showerror("Input Error", "Blend ID is required.")
+            return
+        try:
+            z_retract = float(self._hy_z_retract_var.get())
+            if z_retract <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Input Error", "Z Retract must be a positive number.")
+            return
+        if not self._tracker.baseline_set:
+            messagebox.showerror("No Baseline",
+                                 "Capture Baseline before running the hysteresis test.")
+            return
+        if len(self._v4_z_thresh_map) < 35:
+            messagebox.showerror("Incomplete Calibration",
+                f"z_thresh_map has {len(self._v4_z_thresh_map)}/35 bins.\n"
+                "Run or load a complete v4 calibration first.")
+            return
+
+        cp = self._hy_checkpoint.scan_for_resume()
+        if cp is not None and cp.get("blend_id") == blend_id:
+            resume = messagebox.askyesno(
+                "Resume Session",
+                f"Incomplete hysteresis session found:\n"
+                f"  Timestamp: {cp.get('session_ts', '?')}\n"
+                f"  Bins complete: {len(cp.get('completed_bin_ids', []))}/35\n\n"
+                f"Resume this session?"
+            )
+            if resume:
+                self._hy_session_dir    = str(cp["session_dir"])
+                self._hy_session_ts     = str(cp.get("session_ts", ""))
+                self._hy_bins_completed = list(cp.get("completed_bin_ids", []))
+                self._hy_bins_skipped   = list(cp.get("skipped_bin_ids", []))
+                resume_csv: str | None  = cp.get("csv_path") or None  # type: ignore[assignment]
+                self._hy_writer         = HysteresisWriter(self._hy_session_dir, csv_path=resume_csv)
+                self._hy_blend_id       = blend_id
+                self._hy_z_retract_mm   = z_retract
+                self._hy_z_thresh_map   = {int(k): v for k, v in self._v4_z_thresh_map.items()}
+                self._hy_per_bin_status = {}
+                self._hy_stop_ev.clear()
+                self._hy_state = HY_PANEL_SWEEPING
+                self._set_state(HY_PANEL_SWEEPING)
+                self._hy_worker = threading.Thread(target=self._hy_worker_fn, daemon=True)
+                self._hy_worker.start()
+                return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._hy_blend_id       = blend_id
+        self._hy_session_ts     = ts
+        self._hy_session_dir    = f"output/sessions/{ts}_{blend_id}_hysteresis"
+        self._hy_z_retract_mm   = z_retract
+        self._hy_z_thresh_map   = {int(k): v for k, v in self._v4_z_thresh_map.items()}
+        self._hy_bins_completed = []
+        self._hy_bins_skipped   = []
+        self._hy_per_bin_status = {}
+        self._hy_writer         = HysteresisWriter(self._hy_session_dir)
+        self._hy_stop_ev.clear()
+        self._hy_state = HY_PANEL_SWEEPING
+        self._set_state(HY_PANEL_SWEEPING)
+        self._hy_worker = threading.Thread(target=self._hy_worker_fn, daemon=True)
+        self._hy_worker.start()
+
+    def _hy_worker_fn(self) -> None:
+        n_baseline = len(self._tracker.baseline_positions_mm)
+        total = len(GRID_7X5)
+        z_retract = self._hy_z_retract_mm
+
+        self._ender_sync_cmd("G90", timeout=10.0)
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
+        self._ender_sync_cmd("M400", timeout=30.0)
+
+        consec_failures = 0
+
+        for idx, b in enumerate(GRID_7X5):
+            if self._hy_stop_ev.is_set():
+                break
+            bin_id  = b["bin_id"]
+            x_mm    = b["x_mm"]
+            y_mm    = b["y_mm"]
+            bin_lbl = f"B{bin_id:02d}"
+
+            if bin_id in self._hy_bins_completed:
+                self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  already complete")
+                self._hy_post("progress_frac", (idx + 1) / total)
+                continue
+
+            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  moving XY")
+            self._hy_post("progress_frac", idx / total)
+
+            self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000", timeout=30.0)
+            self._ender_sync_cmd("M400", timeout=30.0)
+
+            if self._hy_stop_ev.is_set():
+                break
+
+            if not self._check_baseline_drift(bin_id):
+                self._hy_stop_ev.set()
+                self._hy_post("status", f"Aborted by operator at {bin_lbl} (drift gate).")
+                break
+
+            entry = self._hy_z_thresh_map.get(bin_id)
+            if entry is None:
+                self._hy_per_bin_status[bin_lbl] = {"mid_loss": True, "HI_pct": None}
+                consec_failures += 1
+                self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  no calibration entry")
+                continue
+
+            z_thresh_mm: float = float(entry["z_thresh_mm"])
+
+            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  loading (pressing)")
+            self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F300", timeout=30.0)
+            self._ender_sync_cmd("M400", timeout=30.0)
+            time.sleep(_Z_SETTLE_S)
+            if self._hy_stop_ev.is_set():
+                break
+
+            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  loading (30 frames)")
+            frames_load = self._hy_collect_frames(_HY_LOADING_FRAMES)
+            if frames_load is None:
+                break
+
+            time.sleep(_Z_SETTLE_S)
+            f_g = self._sample_scale_latest(window_s=_SCALE_SAMPLE_WINDOW_S)
+            f_actual_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
+
+            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  unloading (retracting)")
+            self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F300", timeout=30.0)
+            self._ender_sync_cmd("M400", timeout=30.0)
+            time.sleep(_Z_SETTLE_S)
+            if self._hy_stop_ev.is_set():
+                break
+
+            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  unloading (30 frames)")
+            frames_unload = self._hy_collect_frames(_HY_UNLOADING_FRAMES)
+            if frames_unload is None:
+                break
+
+            last_load   = frames_load[-1][0]  if frames_load   else []
+            last_unload = frames_unload[-1][0] if frames_unload else []
+            mid_loss = (sum(1 for r in last_load   if not r.autofilled) < n_baseline - 1 or
+                        sum(1 for r in last_unload if not r.autofilled) < n_baseline - 1)
+
+            self._hy_per_bin_status[bin_lbl] = {"mid_loss": mid_loss, "HI_pct": None}
+
+            if mid_loss:
+                consec_failures += 1
+                self._hy_post("progress",
+                    f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  tracking loss "
+                    f"({consec_failures}/{_TRACKING_LOSS_STRIKES})")
+                if consec_failures >= _TRACKING_LOSS_STRIKES:
+                    self._hy_bins_skipped.append(bin_id)
+                    self._hy_post("warn_dialog",
+                        f"Bin {bin_lbl}: {_TRACKING_LOSS_STRIKES} consecutive tracking-loss "
+                        f"failures — bin flagged as skipped.")
+                    consec_failures = 0
+            else:
+                consec_failures = 0
+                assert self._hy_writer is not None
+                for fi, (records, ts_ms) in enumerate(frames_load):
+                    self._hy_writer.buffer_frame(records, fi, ts_ms, "loading",
+                                                 bin_id, x_mm, y_mm, float("nan"))
+                self._hy_writer.backfill_loading_force(f_actual_n)
+                for fi, (records, ts_ms) in enumerate(frames_unload):
+                    self._hy_writer.buffer_frame(records, fi, ts_ms, "unloading",
+                                                 bin_id, x_mm, y_mm, float("nan"))
+                self._hy_writer.flush_bin()
+                self._hy_bins_completed.append(bin_id)
+                self._hy_checkpoint.save(
+                    session_dir=self._hy_session_dir,
+                    session_ts=self._hy_session_ts,
+                    blend_id=self._hy_blend_id,
+                    z_retract_mm=self._hy_z_retract_mm,
+                    completed_bin_ids=list(self._hy_bins_completed),
+                    skipped_bin_ids=list(self._hy_bins_skipped),
+                    csv_path=self._hy_writer.csv_path,
+                )
+
+            self._hy_post("progress_frac", (idx + 1) / total)
+
+        if self._hy_writer is not None:
+            self._hy_writer.close()
+
+        if not self._hy_stop_ev.is_set():
+            self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
+            self._ender_sync_cmd("M400", timeout=30.0)
+            self._ender_sync_cmd("G90", timeout=10.0)
+            self._ender_sync_cmd("G1 X0 Y0 F3000", timeout=30.0)
+            self._ender_sync_cmd("M400", timeout=30.0)
+            for bentry in GRID_7X5:
+                lbl = f"B{bentry['bin_id']:02d}"
+                if lbl not in self._hy_per_bin_status:
+                    self._hy_per_bin_status[lbl] = {"mid_loss": False, "HI_pct": None}
+            write_hysteresis_summary(
+                self._hy_session_dir, self._hy_blend_id, self._hy_session_ts,
+                self._hy_z_retract_mm,
+                list(self._hy_bins_completed), list(self._hy_bins_skipped),
+                self._hy_per_bin_status,
+            )
+            skipped_labels = [f"B{b:02d}" for b in sorted(self._hy_bins_skipped)]
+            skipped_str = ", ".join(skipped_labels) if skipped_labels else "none"
+            self._hy_post("done_text",
+                f"Bins complete:  {len(self._hy_bins_completed)} / 35\n"
+                f"Bins skipped:   {skipped_str}")
+            self._hy_post("progress_frac", 1.0)
+            self._hy_post("set_state", HY_PANEL_DONE)
+        else:
+            self._hy_post("status", "Sweep aborted — partial data saved.")
+            self._hy_post("set_state", HY_PANEL_IDLE)
+
+    def _hy_collect_frames(
+        self, n: int, timeout_s: float = 15.0,
+    ) -> list[tuple[list[MarkerRecord], float]] | None:
+        with self._frame_lock:
+            self._frame_buffer.clear()
+        self._recording_active.set()
+        deadline = time.time() + timeout_s
+        while True:
+            with self._frame_lock:
+                count = len(self._frame_buffer)
+            if count >= n or self._hy_stop_ev.is_set() or time.time() > deadline:
+                break
+            time.sleep(0.005)
+        self._recording_active.clear()
+        if self._hy_stop_ev.is_set():
+            return None
+        with self._frame_lock:
+            return list(self._frame_buffer[:n])
+
+    def _hy_on_estop(self) -> None:
+        if self._ender_controller and self._ender_controller.ser \
+                and self._ender_controller.ser.is_open:
+            try:
+                self._ender_controller.ser.write(b"M112\n")
+            except Exception:
+                pass
+        self._hy_stop_ev.set()
+        self._hy_post("status", "E-STOP sent — sweep aborted")
+
+    def _hy_on_return_to_hub(self) -> None:
+        if self._hy_state == HY_PANEL_SWEEPING:
+            messagebox.showwarning("Test Running", "Stop the hysteresis test first.")
+            return
+        threading.Thread(target=self._do_return_to_hub, daemon=True).start()
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Window close
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_closing(self) -> None:
         self._stop_event.set()
         self._pause_event.set()
+        self._st_stop_ev.set()
+        self._hy_stop_ev.set()
         if self._after_id:
             self.after_cancel(self._after_id)
         if self._cap:
             self._cap.release()
-        if self._writer:
-            try:
-                self._writer.close()
-            except Exception:
-                pass
+        for w in (self._st_writer, self._hy_writer):
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
         if self._ender_connected:
             self._ender_cmd_q.put(("disconnect",))
         if self._arduino and self._arduino.is_open:
