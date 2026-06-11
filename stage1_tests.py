@@ -1,5 +1,5 @@
 import customtkinter as ctk
-from ui.sensitivity_window import SensitivityWindow
+from ui.stage1_window import SensitivityWindow
 
 
 def main() -> None:

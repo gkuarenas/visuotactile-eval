@@ -1,5 +1,5 @@
 """
-ui/sensitivity_window.py
+ui/stage1_window.py
 State machine: STARTUP(0) -> BASELINE(1) -> HUB(13)
                -> [Sensitivity] V4_CONFIG(7)..V4_COMPLETE(12)
                -> [Stability]   ST_PANEL_IDLE(14)..ST_PANEL_DONE(16)
@@ -30,7 +30,7 @@ import scienceplots  # noqa: F401  (registers the "science"/"no-latex" styles)
 from core.tracker import Tracker, MarkerRecord
 from ui.overlay import draw_overlay
 from ender.jog_control import Ender3V2Controller
-from output.sensitivity_writer import (
+from output.stage1_writer import (
     write_marker_baselines,
     SensitivityWriterV4, write_sensitivity_summary,
     write_z_thresh_map, load_z_thresh_map,
