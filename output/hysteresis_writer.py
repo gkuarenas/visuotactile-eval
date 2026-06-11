@@ -6,7 +6,9 @@ from datetime import datetime
 from core.tracker import MarkerRecord
 
 HYSTERESIS_COLUMNS = [
-    "bin_id", "bin_x_mm", "bin_y_mm", "phase", "frame", "timestamp_ms",
+    "bin_id", "bin_x_mm", "bin_y_mm", "phase",
+    "ramp_step", "z_depth_mm",
+    "frame", "timestamp_ms",
     "marker_id", "dx_mm", "dy_mm", "delta_z_mm", "abs_delta_z_mm",
     "mean_abs_delta_z_mm", "f_actual_n", "autofilled",
 ]
@@ -39,6 +41,8 @@ class HysteresisWriter:
         frame_idx: int,
         timestamp_ms: float,
         phase: str,
+        ramp_step: int,
+        z_depth_mm: float,
         bin_id: int,
         bin_x_mm: float,
         bin_y_mm: float,
@@ -51,20 +55,22 @@ class HysteresisWriter:
         )
         for r in records:
             self._pending.append({
-                "bin_id":              bin_id,
-                "bin_x_mm":           round(bin_x_mm, 3),
-                "bin_y_mm":           round(bin_y_mm, 3),
-                "phase":              phase,
-                "frame":              frame_idx,
-                "timestamp_ms":       round(timestamp_ms),
-                "marker_id":          r.marker_id,
-                "dx_mm":              round(r.dx_mm, 6),
-                "dy_mm":              round(r.dy_mm, 6),
-                "delta_z_mm":         round(r.delta_z_mm, 6),
-                "abs_delta_z_mm":     round(abs(r.delta_z_mm), 6),
+                "bin_id":               bin_id,
+                "bin_x_mm":            round(bin_x_mm, 3),
+                "bin_y_mm":            round(bin_y_mm, 3),
+                "phase":               phase,
+                "ramp_step":           ramp_step,
+                "z_depth_mm":          round(z_depth_mm, 4),
+                "frame":               frame_idx,
+                "timestamp_ms":        round(timestamp_ms),
+                "marker_id":           r.marker_id,
+                "dx_mm":               round(r.dx_mm, 6),
+                "dy_mm":               round(r.dy_mm, 6),
+                "delta_z_mm":          round(r.delta_z_mm, 6),
+                "abs_delta_z_mm":      round(abs(r.delta_z_mm), 6),
                 "mean_abs_delta_z_mm": round(mean_abs, 6),
-                "f_actual_n":         f_actual_n,
-                "autofilled":         r.autofilled,
+                "f_actual_n":          f_actual_n,
+                "autofilled":          r.autofilled,
             })
 
     def backfill_loading_force(self, f_actual_n: float) -> None:

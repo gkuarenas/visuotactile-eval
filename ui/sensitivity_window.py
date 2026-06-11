@@ -126,8 +126,11 @@ _ST_PLOT_W_PX        = 400
 _ST_PLOT_H_PX        = 160
 
 # ── Hysteresis panel constants ────────────────────────────────────────────────
-_HY_LOADING_FRAMES   = 30
-_HY_UNLOADING_FRAMES = 30
+_HY_RAMP_STEP_MM      = 0.1    # depth increment per ramp step
+_HY_FRAMES_PER_STEP   = 3      # frames recorded at each depth level (30 fps ≈ 100 ms)
+_HY_STEP_SETTLE_S     = 0.10   # wait after each G1 move before recording
+_HY_RAMP_FEEDRATE     = 300    # mm/min — slow ramp inside elastomer
+_HY_APPROACH_FEEDRATE = 3000   # mm/min — fast travel to/from Z=0 (no recording)
 
 
 # ── Module helpers ────────────────────────────────────────────────────────────
@@ -304,6 +307,7 @@ class SensitivityWindow(ctk.CTk):
         self._hy_stop_ev   = threading.Event()
         self._hy_worker: Optional[threading.Thread] = None
         self._hy_blend_id  = ""
+        self._hy_calib_folder = ""
         self._hy_session_dir = ""
         self._hy_session_ts  = ""
         self._hy_z_thresh_map: dict[int, dict] = {}
@@ -823,16 +827,23 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkEntry(setup, textvariable=self._hy_z_retract_var, width=70).grid(
             row=1, column=1, padx=(0, 4), pady=2, sticky="w"
         )
+        ctk.CTkLabel(setup, text="Calib folder:").grid(row=2, column=0, padx=(4, 2), pady=2, sticky="e")
+        calib_row = ctk.CTkFrame(setup, fg_color="transparent")
+        calib_row.grid(row=2, column=1, padx=(0, 4), pady=2, sticky="w")
+        self._hy_folder_var = ctk.StringVar(value="")
+        ctk.CTkEntry(calib_row, textvariable=self._hy_folder_var, width=160).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(calib_row, text="Browse…", width=70,
+                      command=self._hy_on_browse).pack(side="left")
         self._hy_session_info_var = ctk.StringVar(value="Session: —")
         ctk.CTkLabel(setup, textvariable=self._hy_session_info_var,
                      font=ctk.CTkFont(family="Courier", size=10), anchor="w",
                      wraplength=_RIGHT_W - 40).grid(
-            row=2, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w"
+            row=3, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w"
         )
         self._hy_map_info_var = ctk.StringVar(value="z_thresh_map: 0/35 bins")
         ctk.CTkLabel(setup, textvariable=self._hy_map_info_var,
                      font=ctk.CTkFont(family="Courier", size=10), anchor="w").grid(
-            row=3, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w"
+            row=4, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w"
         )
 
         btn_row = ctk.CTkFrame(f, fg_color="transparent")
@@ -2567,6 +2578,40 @@ class SensitivityWindow(ctk.CTk):
     def _hy_post(self, key: str, value: object) -> None:
         self._hy_msg_q.put((key, value))
 
+    def _hy_on_browse(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Select session folder containing z_thresh_map.json"
+        )
+        if folder:
+            self._hy_folder_var.set(folder)
+            self._hy_calib_folder = folder
+            self._hy_try_load_z_thresh_map(folder)
+
+    def _hy_try_load_z_thresh_map(self, folder: str) -> bool:
+        if not folder or not os.path.isdir(folder):
+            self._hy_map_info_var.set("z_thresh_map: 0/35 bins")
+            return False
+        candidates: list[str] = [
+            os.path.join(folder, name)
+            for name in os.listdir(folder)
+            if name.startswith("z_thresh_map") and name.endswith(".json")
+        ]
+        if not candidates:
+            self._hy_map_info_var.set("z_thresh_map: 0/35 bins  (not found)")
+            return False
+        for path in sorted(candidates):
+            data = load_z_thresh_map(path)
+            if data is None:
+                continue
+            bins: dict[int, dict] = data["bins"]
+            if not bins:
+                continue
+            self._v4_z_thresh_map = bins
+            self._hy_map_info_var.set(f"z_thresh_map: {len(bins)}/35 bins  (loaded from folder)")
+            return True
+        self._hy_map_info_var.set("z_thresh_map: 0/35 bins  (parse error)")
+        return False
+
     def _hy_on_start(self) -> None:
         blend_id = self._hy_blend_var.get().strip()
         if not blend_id:
@@ -2634,8 +2679,11 @@ class SensitivityWindow(ctk.CTk):
 
     def _hy_worker_fn(self) -> None:
         n_baseline = len(self._tracker.baseline_positions_mm)
-        total = len(GRID_7X5)
         z_retract = self._hy_z_retract_mm
+
+        center_bin = next(b for b in GRID_7X5 if b["bin_id"] == 18)
+        bins: list[dict] = [center_bin]
+        total = 1
 
         self._ender_sync_cmd("G90", timeout=10.0)
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
@@ -2643,7 +2691,7 @@ class SensitivityWindow(ctk.CTk):
 
         consec_failures = 0
 
-        for idx, b in enumerate(GRID_7X5):
+        for idx, b in enumerate(bins):
             if self._hy_stop_ev.is_set():
                 break
             bin_id  = b["bin_id"]
@@ -2679,38 +2727,79 @@ class SensitivityWindow(ctk.CTk):
 
             z_thresh_mm: float = float(entry["z_thresh_mm"])
 
-            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  loading (pressing)")
-            self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F300", timeout=30.0)
-            self._ender_sync_cmd("M400", timeout=30.0)
-            time.sleep(_Z_SETTLE_S)
-            if self._hy_stop_ev.is_set():
-                break
+            # Fast travel to surface — no recording above Z=0
+            self._ender_sync_cmd(f"G1 Z0.000 F{_HY_APPROACH_FEEDRATE}", timeout=15.0)
+            self._ender_sync_cmd("M400", timeout=15.0)
+            time.sleep(_HY_STEP_SETTLE_S)
 
-            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  loading (30 frames)")
-            frames_load = self._hy_collect_frames(_HY_LOADING_FRAMES)
-            if frames_load is None:
+            # ── Loading ramp: Z=0 → z_thresh in 0.1 mm steps (contact zone only) ──
+            n_load = max(1, round(abs(z_thresh_mm) / _HY_RAMP_STEP_MM))
+            z_load: list[float] = [-_HY_RAMP_STEP_MM * i for i in range(n_load + 1)]
+            z_load[-1] = z_thresh_mm
+
+            all_load_steps: list[tuple[int, float, list[tuple[list[MarkerRecord], float]]]] = []
+            ramp_aborted = False
+            for step_i, z_pos in enumerate(z_load):
+                if self._hy_stop_ev.is_set():
+                    ramp_aborted = True
+                    break
+                self._hy_post("progress",
+                    f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  "
+                    f"loading {step_i + 1}/{n_load} (z={z_pos:.2f} mm)")
+                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{_HY_RAMP_FEEDRATE}", timeout=15.0)
+                self._ender_sync_cmd("M400", timeout=15.0)
+                time.sleep(_HY_STEP_SETTLE_S)
+                step_frames = self._hy_collect_frames(_HY_FRAMES_PER_STEP, timeout_s=3.0)
+                if step_frames is None:
+                    ramp_aborted = True
+                    break
+                all_load_steps.append((step_i, z_pos, step_frames))
+
+            if ramp_aborted or not all_load_steps:
                 break
 
             time.sleep(_Z_SETTLE_S)
             f_g = self._sample_scale_latest(window_s=_SCALE_SAMPLE_WINDOW_S)
             f_actual_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
 
-            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  unloading (retracting)")
-            self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F300", timeout=30.0)
-            self._ender_sync_cmd("M400", timeout=30.0)
-            time.sleep(_Z_SETTLE_S)
-            if self._hy_stop_ev.is_set():
+            # ── Unloading ramp: z_thresh → Z=0 in 0.1 mm steps (contact zone only) ─
+            n_unload = max(1, round(abs(z_thresh_mm) / _HY_RAMP_STEP_MM))
+            z_unload: list[float] = [
+                z_thresh_mm + _HY_RAMP_STEP_MM * (i + 1) for i in range(n_unload)
+            ]
+            z_unload[-1] = 0.0
+
+            all_unload_steps: list[tuple[int, float, list[tuple[list[MarkerRecord], float]]]] = []
+            for step_i, z_pos in enumerate(z_unload):
+                if self._hy_stop_ev.is_set():
+                    ramp_aborted = True
+                    break
+                self._hy_post("progress",
+                    f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  "
+                    f"unloading {step_i + 1}/{n_unload} (z={z_pos:.2f} mm)")
+                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{_HY_RAMP_FEEDRATE}", timeout=15.0)
+                self._ender_sync_cmd("M400", timeout=15.0)
+                time.sleep(_HY_STEP_SETTLE_S)
+                step_frames = self._hy_collect_frames(_HY_FRAMES_PER_STEP, timeout_s=3.0)
+                if step_frames is None:
+                    ramp_aborted = True
+                    break
+                all_unload_steps.append((step_i, z_pos, step_frames))
+
+            # Fast retract from Z=0 to z_retract — no recording above surface
+            if not ramp_aborted:
+                self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F{_HY_APPROACH_FEEDRATE}", timeout=15.0)
+                self._ender_sync_cmd("M400", timeout=15.0)
+
+            if ramp_aborted or not all_unload_steps:
                 break
 
-            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  unloading (30 frames)")
-            frames_unload = self._hy_collect_frames(_HY_UNLOADING_FRAMES)
-            if frames_unload is None:
-                break
-
-            last_load   = frames_load[-1][0]  if frames_load   else []
-            last_unload = frames_unload[-1][0] if frames_unload else []
-            mid_loss = (sum(1 for r in last_load   if not r.autofilled) < n_baseline - 1 or
-                        sum(1 for r in last_unload if not r.autofilled) < n_baseline - 1)
+            last_load_records   = all_load_steps[-1][2][-1][0]
+            last_unload_records = all_unload_steps[-1][2][-1][0]
+            mid_loss = (
+                sum(1 for r in last_load_records   if not r.autofilled) < n_baseline - 1 or
+                sum(1 for r in last_unload_records if not r.autofilled) < n_baseline - 1
+            )
 
             self._hy_per_bin_status[bin_lbl] = {"mid_loss": mid_loss, "HI_pct": None}
 
@@ -2728,13 +2817,23 @@ class SensitivityWindow(ctk.CTk):
             else:
                 consec_failures = 0
                 assert self._hy_writer is not None
-                for fi, (records, ts_ms) in enumerate(frames_load):
-                    self._hy_writer.buffer_frame(records, fi, ts_ms, "loading",
-                                                 bin_id, x_mm, y_mm, float("nan"))
+                global_fi = 0
+                for (step_i, z_pos, step_frames) in all_load_steps:
+                    for (records, ts_ms) in step_frames:
+                        self._hy_writer.buffer_frame(
+                            records, global_fi, ts_ms, "loading",
+                            step_i, z_pos, bin_id, x_mm, y_mm, float("nan"),
+                        )
+                        global_fi += 1
                 self._hy_writer.backfill_loading_force(f_actual_n)
-                for fi, (records, ts_ms) in enumerate(frames_unload):
-                    self._hy_writer.buffer_frame(records, fi, ts_ms, "unloading",
-                                                 bin_id, x_mm, y_mm, float("nan"))
+                global_fi = 0
+                for (step_i, z_pos, step_frames) in all_unload_steps:
+                    for (records, ts_ms) in step_frames:
+                        self._hy_writer.buffer_frame(
+                            records, global_fi, ts_ms, "unloading",
+                            step_i, z_pos, bin_id, x_mm, y_mm, float("nan"),
+                        )
+                        global_fi += 1
                 self._hy_writer.flush_bin()
                 self._hy_bins_completed.append(bin_id)
                 self._hy_checkpoint.save(
