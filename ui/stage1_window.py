@@ -1925,7 +1925,7 @@ class SensitivityWindow(ctk.CTk):
                     if last is not None and sum(1 for r in last if not r.autofilled) < n_baseline - 1:
                         mid_loss = True
                         break
-                    if n >= 30 or self._stop_event.is_set() or time.time() > deadline:
+                    if n >= 10 or self._stop_event.is_set() or time.time() > deadline:
                         break
                     time.sleep(0.005)
                 self._recording_active.clear()
@@ -1966,7 +1966,7 @@ class SensitivityWindow(ctk.CTk):
 
                 consecutive_failures = 0
                 with self._frame_lock:
-                    frames = list(self._frame_buffer[:30])
+                    frames = list(self._frame_buffer[:10])
 
                 if np.isnan(f_actual_n):
                     self._pause_event.set()
