@@ -39,6 +39,10 @@ def build_log_kernel(ksize: int, sigma: float) -> np.ndarray:
     return kernel
 
 
+def _nms_size(sigma: float) -> int:
+    return int(2 * sigma + 1) | 1
+
+
 def detection_labels(
     gray: np.ndarray,
     preprocessed: np.ndarray,
@@ -48,7 +52,7 @@ def detection_labels(
     sigma = params["log_sigma"]
     kernel = build_log_kernel(ksize, sigma)
     response = cv2.filter2D(gray.astype(np.float32), -1, kernel)
-    local_max = response == maximum_filter(response, size=ksize)
+    local_max = response == maximum_filter(response, size=_nms_size(sigma))
     threshold = response.mean() + response.std()
     local_max &= response > threshold
     local_max &= preprocessed > 0
@@ -76,7 +80,7 @@ def detect(
     # Apply to grayscale so the intensity gradient at blob centres is visible
     response = cv2.filter2D(gray.astype(np.float32), -1, kernel)
 
-    local_max = response == maximum_filter(response, size=ksize)
+    local_max = response == maximum_filter(response, size=_nms_size(sigma))
     threshold = response.mean() + response.std()
     local_max &= response > threshold
     # Restrict to pixels inside white (marker) regions of the binary mask

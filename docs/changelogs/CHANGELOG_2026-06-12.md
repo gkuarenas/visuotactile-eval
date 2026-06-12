@@ -102,4 +102,28 @@ Without the clamp, a constrained boundary marker with negative alpha actively dr
 
 ---
 
-*3 commits, 3 uncommitted fixes · 5 files changed*
+### Uncommitted — fix: decouple NMS window from ksize in LoG detection
+*touches `core/detector.py`*
+
+`maximum_filter(response, size=ksize)` was using `ksize` for two independent purposes simultaneously:
+
+| Role | Correct value | Coupling problem |
+|---|---|---|
+| Kernel spatial extent | ≥ 6σ + 1 (e.g. 149 for σ=23.5) | Forces large NMS window |
+| NMS suppression radius | ≈ 2σ (e.g. 49 for σ=23.5) | Forces small kernel |
+
+With a single parameter, achieving a well-formed kernel and correct suppression radius is impossible above σ≈9. Observed failure: ksize=143, σ=23.5 → NMS window 143px > inter-marker spacing → only 23/154 markers survived suppression.
+
+**Fix:** added `_nms_size(sigma) = int(2 * sigma + 1) | 1` (nearest odd integer to 2σ+1). Both `detect()` and `detection_labels()` now call `maximum_filter(response, size=_nms_size(sigma))`. `ksize` continues to control only the kernel extent.
+
+NMS window by sigma after this fix:
+
+| σ | NMS window | ksize needed for valid kernel |
+|---|---|---|
+| 17.0 | 35 px | 103 |
+| 23.5 | 49 px | 143 |
+| 24.9 | 51 px | 151 |
+
+---
+
+*3 commits, 4 uncommitted fixes · 5 files changed*
