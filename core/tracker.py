@@ -80,6 +80,7 @@ class Tracker:
         proc = preprocess(gray, self.params)
         self._last_baseline_binary = proc.copy()
         dets = detect(gray, proc, self.params)
+        dets.sort(key=lambda d: (d[1], d[0]))  # deterministic: top→bottom, left→right
 
         self.kalman.states.clear()
         for i, (x, y, area) in enumerate(dets):

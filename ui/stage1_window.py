@@ -63,6 +63,7 @@ ST_PANEL_DONE    = 16
 HY_PANEL_IDLE    = 17
 HY_PANEL_SWEEPING = 18
 HY_PANEL_DONE    = 19
+V4_RERUNNING     = 20
 
 STATE_NAMES = {
     STARTUP:  "STARTUP",
@@ -80,6 +81,7 @@ STATE_NAMES = {
     HY_PANEL_IDLE:     "HY_PANEL_IDLE",
     HY_PANEL_SWEEPING: "HY_PANEL_SWEEPING",
     HY_PANEL_DONE:     "HY_PANEL_DONE",
+    V4_RERUNNING:      "V4_RERUNNING",
 }
 
 _RIGHT_W = 430
@@ -288,6 +290,7 @@ class SensitivityWindow(ctk.CTk):
         self._v4_skipped_bins: set[int] = set()
         self._v4_idle_noise: dict[int, tuple[float, float]] = {}
         self._v4_summary_csv_path = ""
+        self._v4_csv_path = ""
         self._v4_resume_checkpoint: Optional[dict] = None
         self._v4_thread: Optional[threading.Thread] = None
         self._writer_v4: Optional[SensitivityWriterV4] = None
@@ -742,6 +745,18 @@ class SensitivityWindow(ctk.CTk):
                      font=ctk.CTkFont(family="Courier", size=11)).grid(
             row=9, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
         )
+
+        self._v4_rerun_row = ctk.CTkFrame(f, fg_color="transparent")
+        self._v4_rerun_row.grid(row=10, column=0, columnspan=4, padx=8, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(self._v4_rerun_row, text="Re-run Bin:").pack(side="left", padx=(0, 4))
+        self._v4_rerun_bin_var = ctk.StringVar(value="")
+        ctk.CTkEntry(self._v4_rerun_row, textvariable=self._v4_rerun_bin_var, width=50).pack(side="left", padx=(0, 6))
+        self._v4_rerun_btn = ctk.CTkButton(
+            self._v4_rerun_row, text="Re-run Bin", width=100, state="disabled",
+            command=self._on_rerun_bin_click,
+        )
+        self._v4_rerun_btn.pack(side="left")
+
         return f
 
     def _build_hub_section(self, parent) -> ctk.CTkFrame:
@@ -922,7 +937,7 @@ class SensitivityWindow(ctk.CTk):
     def _apply_visibility(self) -> None:
         s = self._state
         v4_states = (V4_CONFIG, V4_CALIBRATING, V4_CALIBRATION_DONE,
-                     V4_COLLECTING, V4_PAUSED, V4_COMPLETE)
+                     V4_COLLECTING, V4_PAUSED, V4_COMPLETE, V4_RERUNNING)
         st_states = (ST_PANEL_IDLE, ST_PANEL_RUNNING, ST_PANEL_DONE)
         hy_states = (HY_PANEL_IDLE, HY_PANEL_SWEEPING, HY_PANEL_DONE)
 
@@ -952,9 +967,10 @@ class SensitivityWindow(ctk.CTk):
                 state="normal" if s in (V4_CONFIG, V4_CALIBRATION_DONE) and self._v4_calibration_ready()
                 else "disabled"
             )
-            self._v4_pause_btn.configure(state="normal" if s in (V4_CALIBRATING, V4_COLLECTING) else "disabled")
+            self._v4_pause_btn.configure(state="normal" if s in (V4_CALIBRATING, V4_COLLECTING, V4_RERUNNING) else "disabled")
             self._v4_resume_btn.configure(state="normal" if s == V4_PAUSED else "disabled")
             self._v4_return_btn.configure(state="normal" if s in (V4_CONFIG, V4_CALIBRATION_DONE, V4_COMPLETE) else "disabled")
+            self._v4_rerun_btn.configure(state="normal" if s == V4_COMPLETE else "disabled")
 
         if hasattr(self, "_st_start_btn"):
             self._st_start_btn.configure(state="normal" if s == ST_PANEL_IDLE else "disabled")
@@ -1696,6 +1712,7 @@ class SensitivityWindow(ctk.CTk):
                                    self._tracker.baseline_positions_mm)
         if self._writer_v4 is None:
             self._writer_v4 = SensitivityWriterV4(self._session_dir)
+            self._v4_csv_path = self._writer_v4.csv_path
 
         self._v4_phase = "collection"
         self._session_start_t = time.time()
@@ -1748,6 +1765,7 @@ class SensitivityWindow(ctk.CTk):
         else:
             csv_path = cp.get("csv_path", "")
             self._writer_v4 = SensitivityWriterV4(self._session_dir, csv_path=csv_path or None)
+            self._v4_csv_path = self._writer_v4.csv_path
             self._set_state(V4_COLLECTING)
             self._status_var.set("STATE: V4_COLLECTING — resumed from checkpoint")
             self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
@@ -2102,13 +2120,241 @@ class SensitivityWindow(ctk.CTk):
         self._status_var.set("STATE: V4_COMPLETE — sensitivity_summary.csv and figures saved")
 
     # ══════════════════════════════════════════════════════════════════════════
+    # v4 — single-bin re-run
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_rerun_bin_click(self) -> None:
+        raw = self._v4_rerun_bin_var.get().strip()
+        try:
+            bid = int(raw)
+        except ValueError:
+            messagebox.showerror("Invalid Bin", f"'{raw}' is not a valid bin ID.")
+            return
+        match = next((b for b in GRID_7X5 if b["bin_id"] == bid), None)
+        if match is None:
+            messagebox.showerror("Invalid Bin", f"Bin {bid} does not exist in the 7×5 grid.")
+            return
+        if not messagebox.askyesno(
+            "Re-run Bin",
+            f"Re-run bin {bid} (X={match['x_mm']:.3f}, Y={match['y_mm']:.3f})?\n\n"
+            "This will:\n"
+            "  1. Re-calibrate the ceiling depth for this bin\n"
+            "  2. Purge the old rows for this bin from the CSV\n"
+            "  3. Collect fresh reps and regenerate the summary\n\n"
+            "The rest of the session data is untouched.",
+        ):
+            return
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self._set_state(V4_RERUNNING)
+        self._status_var.set(f"STATE: V4_RERUNNING — re-running bin {bid}")
+        self._v4_thread = threading.Thread(
+            target=self._v4_rerun_bin_fn,
+            args=(bid, match["x_mm"], match["y_mm"]),
+            daemon=True,
+        )
+        self._v4_thread.start()
+
+    def _v4_rerun_bin_fn(self, bin_id: int, x_mm: float, y_mm: float) -> None:
+        z_step    = abs(float(self._v4_z_step_var.get()))
+        n_reps    = max(1, int(self._v4_n_reps_var.get()))
+        z_retract = abs(float(self._v4_z_retract_var.get()))
+
+        self._update_v4_progress(f"Re-run bin {bin_id} — moving to clearance")
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+        self._ender_sync_cmd("M400")
+        self._ender_z = _CLEARANCE_Z_MM
+        self.after(0, self._update_ender_pos_display)
+        self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000")
+        self._ender_sync_cmd("M400")
+        self._ender_x, self._ender_y = x_mm, y_mm
+        self.after(0, self._update_ender_pos_display)
+
+        if self._stop_event.is_set():
+            self.after(0, lambda: self._set_state(V4_COMPLETE))
+            return
+
+        # ── Ceiling ramp ──────────────────────────────────────────────────────
+        self._update_v4_progress(f"Re-run bin {bin_id} — ceiling ramp")
+        self._ender_sync_cmd("G1 Z0.000 F300", timeout=10.0)
+        self._ender_sync_cmd("M400")
+        self._ender_z = 0.0
+        self.after(0, self._update_ender_pos_display)
+
+        n_baseline   = self._capture_tracked_count(3)
+        z_current    = 0.0
+        hit_hard_limit = False
+        while True:
+            if self._stop_event.is_set():
+                break
+            self._ender_sync_cmd("G91")
+            self._ender_sync_cmd(f"G1 Z-{z_step:.3f} F100")
+            self._ender_sync_cmd("M400")
+            self._ender_sync_cmd("G90")
+            z_current += z_step
+            self._ender_z = -z_current
+            self.after(0, self._update_ender_pos_display)
+            n_current = self._capture_tracked_count(3)
+            if n_current < n_baseline:
+                break
+            if z_current > Z_HARD_LIMIT_MM:
+                hit_hard_limit = True
+                break
+
+        if self._stop_event.is_set():
+            self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+            self._ender_z = _CLEARANCE_Z_MM
+            self.after(0, self._update_ender_pos_display)
+            self.after(0, lambda: self._set_state(V4_COMPLETE))
+            return
+
+        if hit_hard_limit:
+            z_current = Z_HARD_LIMIT_MM
+
+        z_max_mm    = -z_current
+        z_thresh_mm = 0.90 * z_max_mm
+        f_max_g     = self._sample_scale_latest()
+        if np.isnan(f_max_g):
+            f_max_n:   Optional[float] = None
+            f_thresh_n: Optional[float] = None
+        else:
+            f_max_n    = (f_max_g / 1000.0) * _GRAVITY_MPS2
+            f_thresh_n = 0.90 * f_max_n
+
+        self._ender_sync_cmd(f"G1 Z{_RAMP_RETRACT_MM:.3f} F300", timeout=10.0)
+        self._ender_sync_cmd("M400")
+        self._ender_z = _RAMP_RETRACT_MM
+        self.after(0, self._update_ender_pos_display)
+
+        self._v4_z_thresh_map[bin_id] = {
+            "x_mm": round(x_mm, 3), "y_mm": round(y_mm, 3),
+            "z_max_mm": round(z_max_mm, 4), "z_thresh_mm": round(z_thresh_mm, 4),
+            "f_max_n": round(f_max_n, 4) if f_max_n is not None else None,
+            "f_thresh_n": round(f_thresh_n, 4) if f_thresh_n is not None else None,
+            "capped": hit_hard_limit,
+        }
+
+        # ── Purge old rows for this bin ───────────────────────────────────────
+        if self._v4_csv_path and os.path.exists(self._v4_csv_path):
+            self._update_v4_progress(f"Re-run bin {bin_id} — purging old rows from CSV")
+            df_all  = pd.read_csv(self._v4_csv_path)
+            df_kept = df_all[df_all["bin_id"] != bin_id]
+            df_kept.to_csv(self._v4_csv_path, index=False)
+
+        # ── Re-tare + idle noise ──────────────────────────────────────────────
+        self._retare_scale_if_connected()
+        mu_idle, sigma_idle = self._capture_idle_noise(x_mm, y_mm)
+        self._v4_idle_noise[bin_id] = (mu_idle, sigma_idle)
+
+        if not self._check_baseline_drift(bin_id):
+            self.after(0, lambda: self._set_state(V4_COMPLETE))
+            return
+
+        writer = SensitivityWriterV4(self._session_dir, csv_path=self._v4_csv_path)
+        n_baseline      = self._capture_tracked_count(3)
+        consecutive_failures = 0
+        f_thresh_val    = f_thresh_n if f_thresh_n is not None else float("nan")
+
+        # ── Collection reps ───────────────────────────────────────────────────
+        for rep in range(1, n_reps + 1):
+            if self._stop_event.is_set():
+                break
+            while self._pause_event.is_set() and not self._stop_event.is_set():
+                time.sleep(0.1)
+            if self._stop_event.is_set():
+                break
+
+            self._update_v4_progress(f"Re-run bin {bin_id} — rep {rep}/{n_reps}")
+            self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}")
+            self._ender_sync_cmd("M400")
+            self._ender_z = z_thresh_mm
+            self.after(0, self._update_ender_pos_display)
+            time.sleep(_Z_SETTLE_S)
+            if self._stop_event.is_set():
+                break
+
+            mid_loss = False
+            with self._frame_lock:
+                self._frame_buffer.clear()
+            self._recording_active.set()
+            deadline = time.time() + 15.0
+            while True:
+                with self._frame_lock:
+                    n_buf = len(self._frame_buffer)
+                    last  = self._frame_buffer[-1][0] if self._frame_buffer else None
+                if last is not None and sum(1 for r in last if not r.autofilled) < n_baseline - 1:
+                    mid_loss = True
+                    break
+                if n_buf >= 10 or self._stop_event.is_set() or time.time() > deadline:
+                    break
+                time.sleep(0.005)
+            self._recording_active.clear()
+
+            time.sleep(_Z_SETTLE_S)
+            f_actual_g = self._sample_scale_latest()
+            f_actual_n = (f_actual_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_actual_g) else float("nan")
+
+            self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F{_COLLECT_RETRACT_FEEDRATE}")
+            self._ender_sync_cmd("M400")
+            self._ender_z = z_retract
+            self.after(0, self._update_ender_pos_display)
+
+            if mid_loss:
+                consecutive_failures += 1
+                if consecutive_failures >= _TRACKING_LOSS_STRIKES:
+                    break
+                continue
+
+            consecutive_failures = 0
+            if np.isnan(f_actual_n):
+                continue
+
+            with self._frame_lock:
+                frames = list(self._frame_buffer[:10])
+            for frame_idx, (records, ts) in enumerate(frames):
+                writer.buffer_frame(
+                    records, frame_idx, ts,
+                    bin_id, x_mm, y_mm, rep,
+                    z_thresh_mm, f_thresh_val, f_actual_n,
+                )
+            writer.flush_bin()
+
+        writer.close()
+
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+        self._ender_sync_cmd("M400")
+        self._ender_z = _CLEARANCE_Z_MM
+        self.after(0, self._update_ender_pos_display)
+        self.after(0, self._on_rerun_bin_complete)
+
+    def _on_rerun_bin_complete(self) -> None:
+        rows = self._compute_v4_metrics()
+        self._v4_summary_csv_path = write_sensitivity_summary(self._session_dir, self._v4_blend_id, rows)
+        write_idle_noise_csv(self._session_dir, self._v4_blend_id, self._v4_idle_noise, self._v4_z_thresh_map)
+        self._write_z_thresh_map_checkpoint(complete=True)
+        g = self._compute_global_metrics(rows)
+        self._generate_v4_figures(rows)
+        self._set_state(V4_COMPLETE)
+        self._update_v4_progress(f"Re-run complete — {len(rows)}/{len(GRID_7X5)} bins in summary")
+        self._set_v4_progress_fraction(1.0)
+        self._v4_summary_var.set(
+            f"Sensitivity — U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm   "
+            f"S_global = {g['S_global']:.4f} mm/N   std = {g['S_global_std']:.4f} mm/N   (k={_K_DEFAULT})\n"
+            f"Scalar ref  — U = {g['U_scalar']:.4f}   Rep = {g['Rep_scalar']:.4f} mm   "
+            f"S_mean = {g['S_scalar_mean']:.4f} mm/N   std = {g['S_scalar_std']:.4f} mm/N\n"
+            f"Skipped bins: {sorted(self._v4_skipped_bins) if self._v4_skipped_bins else 'none'}"
+        )
+        self._status_var.set("STATE: V4_COMPLETE — re-run complete, summary updated")
+
+    # ══════════════════════════════════════════════════════════════════════════
     # v4 — post-collection metrics & figures
     # ══════════════════════════════════════════════════════════════════════════
 
     def _compute_v4_metrics(self, k_override: Optional[int] = None) -> list[dict]:
         df: Optional[pd.DataFrame] = None
-        if self._writer_v4 and os.path.exists(self._writer_v4.csv_path):
-            df = pd.read_csv(self._writer_v4.csv_path)
+        _csv = self._writer_v4.csv_path if self._writer_v4 else self._v4_csv_path
+        if _csv and os.path.exists(_csv):
+            df = pd.read_csv(_csv)
             bpos = self._tracker.baseline_positions_mm
             df["baseline_x_mm"] = df["marker_id"].map({mid: xy[0] for mid, xy in bpos.items()})
             df["baseline_y_mm"] = df["marker_id"].map({mid: xy[1] for mid, xy in bpos.items()})
