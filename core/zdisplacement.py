@@ -21,6 +21,6 @@ def compute(
         delta_z_mm = 0.0
     else:
         alpha = (area_current - area_baseline) / area_baseline
-        delta_z_mm = alpha * A_INV
+        delta_z_mm = max(0.0, alpha * A_INV)
 
     return dx_mm, dy_mm, delta_z_mm

@@ -436,7 +436,7 @@ class SensitivityWindow(ctk.CTk):
 
         self._detection_body = ctk.CTkFrame(f, fg_color="transparent")
         params = self._tracker.params
-        self._add_slider(self._detection_body, "LoG ksize", 3, 101, params["log_ksize"],
+        self._add_slider(self._detection_body, "LoG ksize", 3, 201, params["log_ksize"],
                          self._on_ksize_slider, col=0, row=0)
         self._add_slider(self._detection_body, "LoG sigma", 1.0, 30.0, params["log_sigma"],
                          self._on_sigma_slider, col=0, row=1, fmt="{:.1f}")
