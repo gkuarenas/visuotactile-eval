@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from core.detector import default_params, preprocess, detect
+from core.detector import default_params, preprocess, detect, detection_labels
 from core.kalman import KalmanManager
 from core.hungarian import assign
 from core import zdisplacement
@@ -54,6 +54,7 @@ class Tracker:
         self.baseline_set: bool = False
         self.baseline_positions_mm: dict[int, tuple[float, float]] = {}
         self.frame_index: int = 0
+        self._last_baseline_gray: np.ndarray | None = None
         self._last_baseline_binary: np.ndarray | None = None
         self._last_undistorted: np.ndarray | None = None
 
@@ -75,6 +76,7 @@ class Tracker:
     def capture_baseline(self, raw_frame: np.ndarray) -> int:
         undistorted = self._undistort(raw_frame)
         gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
+        self._last_baseline_gray = gray.copy()
         proc = preprocess(gray, self.params)
         self._last_baseline_binary = proc.copy()
         dets = detect(gray, proc, self.params)
@@ -102,6 +104,20 @@ class Tracker:
         if count < 100:
             print(f"Warning: only {count} markers detected at baseline (expected ~154)")
         return count
+
+    def build_detection_diagnostic(self) -> np.ndarray | None:
+        if self._last_baseline_gray is None or self._last_baseline_binary is None:
+            return None
+        labels, accepted = detection_labels(
+            self._last_baseline_gray, self._last_baseline_binary, self.params
+        )
+        vis = np.zeros((*self._last_baseline_gray.shape, 3), dtype=np.uint8)
+        for lbl in np.unique(labels).tolist():
+            if lbl == 0:
+                continue
+            mask = labels == lbl
+            vis[mask] = (0, 255, 0) if lbl in accepted else (0, 0, 255)
+        return vis
 
     def process_frame(self, raw_frame: np.ndarray) -> list[MarkerRecord]:
         if not self.baseline_set:

@@ -84,8 +84,8 @@ STATE_NAMES = {
 _RIGHT_W = 430
 _CLEARANCE_Z_MM = 3.0   # +Z clearance above the captured zero, used for all XY travel
 _GRAVITY_MPS2 = 9.80665 # standard gravity — converts scale readings (g) to N
-_Z_SETTLE_S = 0.5       # pause after Z reaches target before recording starts —
-                        # flushes in-flight camera frames and lets ringing stop
+_Z_SETTLE_S = 1.0       # pause after Z reaches target before recording starts —
+                        # flushes in-flight camera frames and lets viscoelastic creep settle
 
 # ── v4 protocol constants ────────────────────────────────────────────────────
 
@@ -106,6 +106,8 @@ DRIFT_GATE_PX     = 3.0   # max allowed mean per-marker centroid drift before a 
 Z_HARD_LIMIT_MM   = 10.0  # absolute descent depth limit during the ceiling ramp (mm)
 _RAMP_RETRACT_MM  = 1.0   # clearance retracted past the Z=0 contact reference after each ramp
 _TRACKING_LOSS_STRIKES = 3  # consecutive mid-press tracking-loss reps before a bin is skipped
+_COLLECT_PRESS_FEEDRATE    = 150  # mm/min — quasi-static approach, closer to calibration ramp (F100)
+_COLLECT_RETRACT_FEEDRATE  = 300  # mm/min — fast retract, no effect on displacement data
 
 # Load-cell (HX711) telemetry — streamed continuously by a dedicated second
 # Arduino, asynchronously and at a much higher rate than the 30 fps camera.
@@ -114,6 +116,7 @@ _TRACKING_LOSS_STRIKES = 3  # consecutive mid-press tracking-loss reps before a 
 _SCALE_BAUD = 57600
 _SCALE_BUFFER_MAXLEN = 2000     # ring buffer capacity (~25 s of headroom at 80 Hz)
 _SCALE_SAMPLE_WINDOW_S = 0.2    # trailing window averaged for a single-point sample
+_SCALE_RETARE_SETTLE_S = 0.3    # wait before/after per-bin re-tare (probe at clearance, no contact)
 
 # ── Stability panel constants ─────────────────────────────────────────────────
 _ST_HOLD_FRAMES      = 900   # 30 s at 30 fps
@@ -129,7 +132,7 @@ _ST_PLOT_H_PX        = 160
 _HY_RAMP_STEP_MM      = 0.1    # depth increment per ramp step
 _HY_FRAMES_PER_STEP   = 3      # frames recorded at each depth level (30 fps ≈ 100 ms)
 _HY_STEP_SETTLE_S     = 0.10   # wait after each G1 move before recording
-_HY_RAMP_FEEDRATE     = 300    # mm/min — slow ramp inside elastomer
+_HY_RAMP_FEEDRATE     = 150    # mm/min — ramp inside elastomer (matches _COLLECT_PRESS_FEEDRATE)
 _HY_APPROACH_FEEDRATE = 3000   # mm/min — fast travel to/from Z=0 (no recording)
 
 
@@ -231,6 +234,8 @@ class SensitivityWindow(ctk.CTk):
         self._after_id: Optional[str] = None
         self._feed_frozen = False
         self._last_annotated: Optional[np.ndarray] = None
+        self._diag_frame: Optional[np.ndarray] = None
+        self._diag_frame_until: float = 0.0
 
         # Frame recording — shared with grid thread via _frame_lock
         self._frame_buffer: list[tuple[list[MarkerRecord], float]] = []
@@ -272,6 +277,7 @@ class SensitivityWindow(ctk.CTk):
         # ── v4 protocol state ─────────────────────────────────────────────
         self._checkpoint_v4 = CheckpointManagerV4()
         self._v4_blend_id = ""
+        self._v4_sample_n = 1
         self._v4_phase = ""   # "calibration" | "collection" | "complete"
         self._v4_z_thresh_map: dict[int, dict] = {}   # bin_id -> {x_mm,y_mm,z_max_mm,z_thresh_mm,f_max_n,f_thresh_n}
         self._v4_z_thresh_map_path = ""
@@ -420,19 +426,36 @@ class SensitivityWindow(ctk.CTk):
 
     def _build_detection_params_section(self, parent) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent)
-        ctk.CTkLabel(f, text="Detection Params", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(4, 2), sticky="w"
-        )
+        self._detection_collapsed = True
+        self._detection_toggle_var = ctk.StringVar(value="▶  Detection Params")
+        ctk.CTkButton(
+            f, textvariable=self._detection_toggle_var,
+            fg_color="transparent", hover_color="gray30", anchor="w",
+            font=ctk.CTkFont(weight="bold"), command=self._toggle_detection_params,
+        ).grid(row=0, column=0, columnspan=3, padx=4, pady=(4, 2), sticky="ew")
+
+        self._detection_body = ctk.CTkFrame(f, fg_color="transparent")
         params = self._tracker.params
-        self._add_slider(f, "LoG ksize", 3, 101, params["log_ksize"],
-                         self._on_ksize_slider, col=0, row=1)
-        self._add_slider(f, "LoG sigma", 1.0, 30.0, params["log_sigma"],
-                         self._on_sigma_slider, col=0, row=2, fmt="{:.1f}")
-        self._add_slider(f, "Gate px", 20, 400, self._tracker.gate_px,
-                         self._on_gate_slider, col=0, row=3)
-        self._add_slider(f, "Threshold", 1, 255, params["thresh"],
-                         self._on_thresh_slider, col=0, row=4)
+        self._add_slider(self._detection_body, "LoG ksize", 3, 101, params["log_ksize"],
+                         self._on_ksize_slider, col=0, row=0)
+        self._add_slider(self._detection_body, "LoG sigma", 1.0, 30.0, params["log_sigma"],
+                         self._on_sigma_slider, col=0, row=1, fmt="{:.1f}")
+        self._add_slider(self._detection_body, "Gate px", 20, 400, self._tracker.gate_px,
+                         self._on_gate_slider, col=0, row=2)
+        self._add_slider(self._detection_body, "Threshold", 1, 255, params["thresh"],
+                         self._on_thresh_slider, col=0, row=3)
+        # body hidden by default; shown when toggled
         return f
+
+    def _toggle_detection_params(self) -> None:
+        if self._detection_collapsed:
+            self._detection_body.grid(row=1, column=0, columnspan=3, sticky="ew")
+            self._detection_toggle_var.set("▼  Detection Params")
+            self._detection_collapsed = False
+        else:
+            self._detection_body.grid_remove()
+            self._detection_toggle_var.set("▶  Detection Params")
+            self._detection_collapsed = True
 
     def _on_ksize_slider(self, value: float) -> None:
         self._tracker.params["log_ksize"] = int(value) | 1
@@ -664,9 +687,14 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkEntry(f, textvariable=self._v4_z_retract_var, width=60).grid(
             row=2, column=3, padx=(0, 8), pady=2, sticky="w"
         )
+        ctk.CTkLabel(f, text="Sample #:").grid(row=3, column=0, padx=(8, 2), sticky="e")
+        self._v4_sample_n_var = tk.IntVar(value=1)
+        ctk.CTkEntry(f, textvariable=self._v4_sample_n_var, width=60).grid(
+            row=3, column=1, padx=(0, 8), pady=2, sticky="w"
+        )
 
         br = ctk.CTkFrame(f, fg_color="transparent")
-        br.grid(row=3, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w")
+        br.grid(row=4, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w")
         self._v4_calib_btn = ctk.CTkButton(br, text="Calibration", width=104, command=self._on_v4_calibration)
         self._v4_calib_btn.pack(side="left", padx=(0, 6))
         self._v4_run_btn = ctk.CTkButton(br, text="Run Sensitivity", width=128,
@@ -677,7 +705,7 @@ class SensitivityWindow(ctk.CTk):
         self._v4_load_btn.pack(side="left")
 
         ctrl_row = ctk.CTkFrame(f, fg_color="transparent")
-        ctrl_row.grid(row=4, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w")
+        ctrl_row.grid(row=5, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w")
         self._v4_pause_btn = ctk.CTkButton(ctrl_row, text="Pause", width=80, state="disabled",
                                            command=self._on_v4_pause)
         self._v4_pause_btn.pack(side="left", padx=(0, 6))
@@ -694,21 +722,21 @@ class SensitivityWindow(ctk.CTk):
         self._v4_progress_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_progress_var, anchor="w",
                      font=ctk.CTkFont(family="Courier", size=11), wraplength=_RIGHT_W - 20).grid(
-            row=5, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+            row=6, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
         )
         self._v4_progress_bar = ctk.CTkProgressBar(f, width=_RIGHT_W - 60)
         self._v4_progress_bar.set(0.0)
-        self._v4_progress_bar.grid(row=6, column=0, columnspan=4, padx=8, pady=(2, 4), sticky="w")
+        self._v4_progress_bar.grid(row=7, column=0, columnspan=4, padx=8, pady=(2, 4), sticky="w")
 
         self._v4_summary_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_summary_var, anchor="w", justify="left",
                      font=ctk.CTkFont(family="Courier", size=10)).grid(
-            row=7, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+            row=8, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
         )
         self._v4_force_var = ctk.StringVar(value="Force: — g  /  — N")
         ctk.CTkLabel(f, textvariable=self._v4_force_var, anchor="w",
                      font=ctk.CTkFont(family="Courier", size=11)).grid(
-            row=8, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
+            row=9, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
         )
         return f
 
@@ -973,7 +1001,12 @@ class SensitivityWindow(ctk.CTk):
                 else:
                     annotated = self._tracker.undistort(frame)
                 self._last_annotated = annotated
-                self._update_feed(annotated)
+                display = (
+                    self._diag_frame
+                    if self._diag_frame is not None and time.time() < self._diag_frame_until
+                    else annotated
+                )
+                self._update_feed(display)
         self._after_id = self.after(33, self._frame_loop)
 
     def _update_feed(self, frame: np.ndarray) -> None:
@@ -1189,7 +1222,7 @@ class SensitivityWindow(ctk.CTk):
         # Disabling auto-exposure also stops the driver's auto-brightness
         # adjustment, which would otherwise drift detection thresholds mid-session.
         self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        self._cap.set(cv2.CAP_PROP_EXPOSURE, -6) 
+        self._cap.set(cv2.CAP_PROP_EXPOSURE, -5) 
 
     # ══════════════════════════════════════════════════════════════════════════
     # BASELINE handlers
@@ -1215,6 +1248,10 @@ class SensitivityWindow(ctk.CTk):
         if n < 100:
             msg += "  [WARNING: expected ~154]"
         self._jog_status_lbl.configure(text=msg)
+        diag = self._tracker.build_detection_diagnostic()
+        if diag is not None:
+            self._diag_frame = diag
+            self._diag_frame_until = time.time() + 3.0
 
         if self._v4_resume_checkpoint:
             self._resume_v4_session()
@@ -1470,6 +1507,14 @@ class SensitivityWindow(ctk.CTk):
             return float("nan")
         return sum(readings) / len(readings)
 
+    def _retare_scale_if_connected(self) -> None:
+        """Re-zero the load cell while the probe is at clearance height (no contact).
+        Called once per bin before the reps loop to cancel HX711 thermal drift."""
+        if self._scale_arduino and self._scale_arduino.is_open:
+            time.sleep(_SCALE_RETARE_SETTLE_S)
+            self._scale_arduino.write(b"t\n")
+            time.sleep(_SCALE_RETARE_SETTLE_S)
+
     # ══════════════════════════════════════════════════════════════════════════
     # v4 — checkpointing
     # ══════════════════════════════════════════════════════════════════════════
@@ -1487,6 +1532,7 @@ class SensitivityWindow(ctk.CTk):
             session_dir=self._session_dir,
             session_ts=self._session_ts,
             blend_id=self._v4_blend_id,
+            sample_n=self._v4_sample_n,
             phase=self._v4_phase,
             z_thresh_map_path=self._v4_z_thresh_map_path,
             completed_calibration_bins=sorted(self._v4_z_thresh_map.keys()),
@@ -1545,6 +1591,7 @@ class SensitivityWindow(ctk.CTk):
         ):
             return
         self._v4_blend_id = blend_id
+        self._v4_sample_n = max(1, int(self._v4_sample_n_var.get()))
         self._launch_v4_calibration()
 
     def _on_v4_run_sensitivity(self) -> None:
@@ -1559,6 +1606,7 @@ class SensitivityWindow(ctk.CTk):
             messagebox.showerror("Input Error", "Enter a Blend ID before starting collection.")
             return
         self._v4_blend_id = blend_id
+        self._v4_sample_n = max(1, int(self._v4_sample_n_var.get()))
         self._launch_v4_collection()
 
     def _on_v4_load_calibration(self) -> None:
@@ -1593,7 +1641,7 @@ class SensitivityWindow(ctk.CTk):
     def _launch_v4_calibration(self) -> None:
         self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._session_dir = os.path.join("output", "sessions",
-                                          f"{self._session_ts}_{self._v4_blend_id}_sensitivity")
+                                          f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity")
         os.makedirs(self._session_dir, exist_ok=True)
         write_marker_baselines(self._session_dir, self._session_ts,
                                self._tracker.baseline_positions_mm)
@@ -1616,7 +1664,7 @@ class SensitivityWindow(ctk.CTk):
         if not self._session_dir:
             self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
             self._session_dir = os.path.join("output", "sessions",
-                                              f"{self._session_ts}_{self._v4_blend_id}_sensitivity")
+                                              f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity")
             os.makedirs(self._session_dir, exist_ok=True)
             write_marker_baselines(self._session_dir, self._session_ts,
                                    self._tracker.baseline_positions_mm)
@@ -1652,6 +1700,8 @@ class SensitivityWindow(ctk.CTk):
         self._session_ts  = cp.get("session_ts", "")
         self._v4_blend_id = cp.get("blend_id", "")
         self._v4_blend_id_var.set(self._v4_blend_id)
+        self._v4_sample_n = cp.get("sample_n", 1)
+        self._v4_sample_n_var.set(self._v4_sample_n)
         self._v4_phase    = cp.get("phase", "calibration")
         self._v4_summary_csv_path = cp.get("summary_csv_path", "")
         self._load_resume_z_thresh_map(cp)
@@ -1681,13 +1731,14 @@ class SensitivityWindow(ctk.CTk):
         cp = self._checkpoint_v4.scan_for_resume()
         if cp is None:
             return
-        ts    = cp.get("session_ts", "unknown")
-        phase = cp.get("phase", "unknown")
-        blend = cp.get("blend_id", "")
+        ts     = cp.get("session_ts", "unknown")
+        phase  = cp.get("phase", "unknown")
+        blend  = cp.get("blend_id", "")
+        sample = cp.get("sample_n", 1)
         if messagebox.askyesno(
             "Resume v4 Session",
             f"Incomplete v4 session found:\n  Timestamp: {ts}\n  Blend ID: {blend}\n"
-            f"  Phase: {phase}\n\nResume this session?",
+            f"  Sample #: {sample}\n  Phase: {phase}\n\nResume this session?",
         ):
             self._v4_resume_checkpoint = cp
             self._status_var.set(f"STATE: STARTUP — will resume v4 session {ts} ({phase} phase)")
@@ -1883,6 +1934,7 @@ class SensitivityWindow(ctk.CTk):
             self._ender_sync_cmd("M400")
             self._ender_x, self._ender_y = x_mm, y_mm
             self.after(0, self._update_ender_pos_display)
+            self._retare_scale_if_connected()
 
             if not self._check_baseline_drift(bin_id):
                 self._stop_event.set()
@@ -1905,7 +1957,7 @@ class SensitivityWindow(ctk.CTk):
                 self._update_v4_progress(f"Collection — bin {bin_id}/{total}, rep {rep}/{n_reps}")
 
                 # Press to Z_thresh — absolute move from the G92 contact reference (Z=0)
-                self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F300")
+                self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}")
                 self._ender_sync_cmd("M400")
                 self._ender_z = z_thresh_mm
                 self.after(0, self._update_ender_pos_display)
@@ -1942,7 +1994,7 @@ class SensitivityWindow(ctk.CTk):
 
                 # Retract past contact reference + configured clearance — same
                 # absolute target whether the press completed or lost tracking
-                self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F300")
+                self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F{_COLLECT_RETRACT_FEEDRATE}")
                 self._ender_sync_cmd("M400")
                 self._ender_z = z_retract
                 self.after(0, self._update_ender_pos_display)
@@ -1987,7 +2039,7 @@ class SensitivityWindow(ctk.CTk):
                         )
                     self._writer_v4.flush_bin()
 
-                time.sleep(0.5)
+                time.sleep(1.0)  # allow load cell to settle back to zero before next press
                 done_reps.add(rep)
                 self._save_v4_checkpoint()
 
@@ -2350,7 +2402,7 @@ class SensitivityWindow(ctk.CTk):
 
         self._st_post("status", f"Pressing to Z={self._st_z_thresh_mm:.3f} mm…")
         self._ender_sync_cmd("G90", timeout=10.0)
-        self._ender_sync_cmd(f"G1 Z{self._st_z_thresh_mm:.3f} F300", timeout=60.0)
+        self._ender_sync_cmd(f"G1 Z{self._st_z_thresh_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}", timeout=60.0)
         self._ender_sync_cmd("M400", timeout=60.0)
         if self._st_stop_ev.is_set():
             self._st_do_retract()

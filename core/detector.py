@@ -39,6 +39,31 @@ def build_log_kernel(ksize: int, sigma: float) -> np.ndarray:
     return kernel
 
 
+def detection_labels(
+    gray: np.ndarray,
+    preprocessed: np.ndarray,
+    params: dict,
+) -> tuple[np.ndarray, set[int]]:
+    ksize = params["log_ksize"]
+    sigma = params["log_sigma"]
+    kernel = build_log_kernel(ksize, sigma)
+    response = cv2.filter2D(gray.astype(np.float32), -1, kernel)
+    local_max = response == maximum_filter(response, size=ksize)
+    threshold = response.mean() + response.std()
+    local_max &= response > threshold
+    local_max &= preprocessed > 0
+    ys, xs = np.where(local_max)
+    _, labels, _, _ = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
+    h, w = gray.shape[:2]
+    accepted: set[int] = set()
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        if 0 <= x < w and 0 <= y < h:
+            label = int(labels[y, x])
+            if label != 0:
+                accepted.add(label)
+    return labels, accepted
+
+
 def detect(
     gray: np.ndarray,
     preprocessed: np.ndarray,

@@ -16,6 +16,7 @@ class CheckpointManagerV4:
         session_dir: str,
         session_ts: str,
         blend_id: str,
+        sample_n: int,
         phase: str,
         z_thresh_map_path: str,
         completed_calibration_bins: list[int],
@@ -26,6 +27,7 @@ class CheckpointManagerV4:
         payload = {
             "session_ts": session_ts,
             "blend_id": blend_id,
+            "sample_n": sample_n,
             "phase": phase,
             "z_thresh_map_path": z_thresh_map_path,
             "completed_calibration_bins": completed_calibration_bins,
