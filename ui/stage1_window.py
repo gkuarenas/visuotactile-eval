@@ -34,6 +34,7 @@ from output.stage1_writer import (
     write_marker_baselines,
     SensitivityWriterV4, write_sensitivity_summary,
     write_z_thresh_map, load_z_thresh_map,
+    write_idle_noise_csv,
 )
 import io
 from output.checkpoint import CheckpointManagerV4, CheckpointManagerHysteresis
@@ -117,6 +118,8 @@ _SCALE_BAUD = 57600
 _SCALE_BUFFER_MAXLEN = 2000     # ring buffer capacity (~25 s of headroom at 80 Hz)
 _SCALE_SAMPLE_WINDOW_S = 0.2    # trailing window averaged for a single-point sample
 _SCALE_RETARE_SETTLE_S = 0.3    # wait before/after per-bin re-tare (probe at clearance, no contact)
+_IDLE_CAPTURE_N  = 30           # frames captured during post-retare window for per-bin noise floor
+_IDLE_DISCARD_N  = 9            # discard first ≈0.3 s at 30 fps (post-retare settle)
 
 # ── Stability panel constants ─────────────────────────────────────────────────
 _ST_HOLD_FRAMES      = 900   # 30 s at 30 fps
@@ -283,6 +286,7 @@ class SensitivityWindow(ctk.CTk):
         self._v4_z_thresh_map_path = ""
         self._v4_completed_reps: dict[int, set[int]] = {}
         self._v4_skipped_bins: set[int] = set()
+        self._v4_idle_noise: dict[int, tuple[float, float]] = {}
         self._v4_summary_csv_path = ""
         self._v4_resume_checkpoint: Optional[dict] = None
         self._v4_thread: Optional[threading.Thread] = None
@@ -1509,11 +1513,32 @@ class SensitivityWindow(ctk.CTk):
 
     def _retare_scale_if_connected(self) -> None:
         """Re-zero the load cell while the probe is at clearance height (no contact).
-        Called once per bin before the reps loop to cancel HX711 thermal drift."""
+        Called once per bin before the reps loop to cancel HX711 thermal drift.
+        Post-retare settle is provided by _capture_idle_noise discarding the first
+        _IDLE_DISCARD_N frames."""
         if self._scale_arduino and self._scale_arduino.is_open:
             time.sleep(_SCALE_RETARE_SETTLE_S)
             self._scale_arduino.write(b"t\n")
-            time.sleep(_SCALE_RETARE_SETTLE_S)
+
+    def _capture_idle_noise(self, x_mm: float, y_mm: float) -> tuple[float, float]:
+        frames = self._capture_n_frames(_IDLE_CAPTURE_N, timeout_s=5.0)
+        usable = frames[_IDLE_DISCARD_N:]
+        if not usable:
+            return float("nan"), float("nan")
+        bpos = self._tracker.baseline_positions_mm
+        if not bpos:
+            return float("nan"), float("nan")
+        sorted_ids = sorted(bpos, key=lambda mid: (bpos[mid][0] - x_mm) ** 2 + (bpos[mid][1] - y_mm) ** 2)
+        k_ids = set(sorted_ids[:_K_DEFAULT])
+        d_bar_values: list[float] = []
+        for records, _ in usable:
+            vals = [abs(r.delta_z_mm) for r in records if r.marker_id in k_ids]
+            if vals:
+                d_bar_values.append(float(np.mean(vals)))
+        if not d_bar_values:
+            return float("nan"), float("nan")
+        arr = np.array(d_bar_values, dtype=float)
+        return float(np.mean(arr)), float(np.std(arr))
 
     # ══════════════════════════════════════════════════════════════════════════
     # v4 — checkpointing
@@ -1649,6 +1674,7 @@ class SensitivityWindow(ctk.CTk):
         self._v4_z_thresh_map = {}
         self._v4_skipped_bins = set()
         self._v4_completed_reps = {}
+        self._v4_idle_noise = {}
         self._v4_phase = "calibration"
         self._session_start_t = time.time()
         self._pause_event.clear()
@@ -1935,6 +1961,8 @@ class SensitivityWindow(ctk.CTk):
             self._ender_x, self._ender_y = x_mm, y_mm
             self.after(0, self._update_ender_pos_display)
             self._retare_scale_if_connected()
+            mu_idle, sigma_idle = self._capture_idle_noise(x_mm, y_mm)
+            self._v4_idle_noise[bin_id] = (mu_idle, sigma_idle)
 
             if not self._check_baseline_drift(bin_id):
                 self._stop_event.set()
@@ -2054,6 +2082,7 @@ class SensitivityWindow(ctk.CTk):
     def _on_collection_complete(self) -> None:
         rows = self._compute_v4_metrics()
         self._v4_summary_csv_path = write_sensitivity_summary(self._session_dir, self._v4_blend_id, rows)
+        write_idle_noise_csv(self._session_dir, self._v4_blend_id, self._v4_idle_noise, self._v4_z_thresh_map)
         if self._writer_v4:
             self._writer_v4.close()
             self._writer_v4 = None

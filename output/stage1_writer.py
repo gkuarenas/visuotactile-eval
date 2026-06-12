@@ -248,6 +248,30 @@ def write_z_thresh_map(
     return final
 
 
+def write_idle_noise_csv(
+    session_dir: str,
+    blend_id: str,
+    idle_noise: dict[int, tuple[float, float]],
+    z_thresh_map: dict[int, dict],
+) -> str:
+    os.makedirs(session_dir, exist_ok=True)
+    suffix = f"_{blend_id}" if blend_id else ""
+    path = os.path.join(session_dir, f"idle_noise{suffix}.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["bin_id", "bin_x_mm", "bin_y_mm", "mu_idle_mm", "sigma_idle_mm"])
+        w.writeheader()
+        for bin_id, (mu, sigma) in sorted(idle_noise.items()):
+            entry = z_thresh_map.get(bin_id, {})
+            w.writerow({
+                "bin_id": bin_id,
+                "bin_x_mm": entry.get("x_mm", ""),
+                "bin_y_mm": entry.get("y_mm", ""),
+                "mu_idle_mm": "" if mu != mu else round(mu, 6),
+                "sigma_idle_mm": "" if sigma != sigma else round(sigma, 6),
+            })
+    return path
+
+
 def load_z_thresh_map(path: str) -> dict | None:
     try:
         with open(path, "r") as f:
