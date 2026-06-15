@@ -110,6 +110,7 @@ _K_BOUNDARY_EXCL_MM = 2.5  # exclude markers within this distance of the working
 DRIFT_GATE_PX     = 3.0   # max allowed mean per-marker centroid drift before a bin (px)
 Z_HARD_LIMIT_MM   = 10.0  # absolute descent depth limit during the ceiling ramp (mm)
 _RAMP_RETRACT_MM  = 1.0   # clearance retracted past the Z=0 contact reference after each ramp
+_RAMP_LOSS_STRIKES = 3    # consecutive below-baseline checks before the ceiling ramp declares loss
 _TRACKING_LOSS_STRIKES = 3  # consecutive mid-press tracking-loss reps before a bin is skipped
 _COLLECT_PRESS_FEEDRATE    = 150  # mm/min — quasi-static approach, closer to calibration ramp (F100)
 _COLLECT_RETRACT_FEEDRATE  = 300  # mm/min — fast retract, no effect on displacement data
@@ -1838,6 +1839,8 @@ class SensitivityWindow(ctk.CTk):
             n_baseline = self._capture_tracked_count(3)
             z_current = 0.0
             hit_hard_limit = False
+            _ramp_strikes = 0
+            _z_first_strike = 0.0
             while True:
                 if self._pause_event.is_set() or self._stop_event.is_set():
                     break
@@ -1849,12 +1852,19 @@ class SensitivityWindow(ctk.CTk):
                 self._ender_z = -z_current
                 self.after(0, self._update_ender_pos_display)
 
-                n_current = self._capture_tracked_count(3)
-                if n_current < n_baseline:
-                    break
                 if z_current > Z_HARD_LIMIT_MM:
                     hit_hard_limit = True
                     break
+                n_current = self._capture_tracked_count(3)
+                if n_current < n_baseline:
+                    if _ramp_strikes == 0:
+                        _z_first_strike = z_current
+                    _ramp_strikes += 1
+                    if _ramp_strikes >= _RAMP_LOSS_STRIKES:
+                        z_current = _z_first_strike
+                        break
+                else:
+                    _ramp_strikes = 0
 
             if self._pause_event.is_set() or self._stop_event.is_set():
                 self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
@@ -2196,6 +2206,8 @@ class SensitivityWindow(ctk.CTk):
         n_baseline   = self._capture_tracked_count(3)
         z_current    = 0.0
         hit_hard_limit = False
+        _ramp_strikes = 0
+        _z_first_strike = 0.0
         while True:
             if self._stop_event.is_set():
                 break
@@ -2206,12 +2218,19 @@ class SensitivityWindow(ctk.CTk):
             z_current += z_step
             self._ender_z = -z_current
             self.after(0, self._update_ender_pos_display)
-            n_current = self._capture_tracked_count(3)
-            if n_current < n_baseline:
-                break
             if z_current > Z_HARD_LIMIT_MM:
                 hit_hard_limit = True
                 break
+            n_current = self._capture_tracked_count(3)
+            if n_current < n_baseline:
+                if _ramp_strikes == 0:
+                    _z_first_strike = z_current
+                _ramp_strikes += 1
+                if _ramp_strikes >= _RAMP_LOSS_STRIKES:
+                    z_current = _z_first_strike
+                    break
+            else:
+                _ramp_strikes = 0
 
         if self._stop_event.is_set():
             self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
