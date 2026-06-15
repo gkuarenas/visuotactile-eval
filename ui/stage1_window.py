@@ -5,6 +5,7 @@ State machine: STARTUP(0) -> BASELINE(1) -> HUB(13)
                -> [Stability]   ST_PANEL_IDLE(14)..ST_PANEL_DONE(16)
                -> [Hysteresis]  HY_PANEL_IDLE(17)..HY_PANEL_DONE(19)
 """
+import json
 import os
 import re
 import time
@@ -105,6 +106,7 @@ _GRID_7X5_Y_OFFSET_MM = -1.2
 _GRID_7X5_X_OFFSET_MM = 0.0
 
 _K_DEFAULT        = 4     # k nearest markers per bin for S_local (pure Euclidean, no footprint)
+_K_BOUNDARY_EXCL_MM = 2.5  # exclude markers within this distance of the working-area edge from k-NN pool
 DRIFT_GATE_PX     = 3.0   # max allowed mean per-marker centroid drift before a bin (px)
 Z_HARD_LIMIT_MM   = 10.0  # absolute descent depth limit during the ceiling ramp (mm)
 _RAMP_RETRACT_MM  = 1.0   # clearance retracted past the Z=0 contact reference after each ramp
@@ -1681,8 +1683,8 @@ class SensitivityWindow(ctk.CTk):
 
     def _launch_v4_calibration(self) -> None:
         self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._session_dir = os.path.join("output", "sessions",
-                                          f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity")
+        self._session_dir = os.path.join("output", "sessions", self._v4_blend_id,
+                                          f"{self._session_ts}_n{self._v4_sample_n}_sensitivity")
         os.makedirs(self._session_dir, exist_ok=True)
         write_marker_baselines(self._session_dir, self._session_ts,
                                self._tracker.baseline_positions_mm)
@@ -1705,8 +1707,8 @@ class SensitivityWindow(ctk.CTk):
     def _launch_v4_collection(self) -> None:
         if not self._session_dir:
             self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._session_dir = os.path.join("output", "sessions",
-                                              f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity")
+            self._session_dir = os.path.join("output", "sessions", self._v4_blend_id,
+                                              f"{self._session_ts}_n{self._v4_sample_n}_sensitivity")
             os.makedirs(self._session_dir, exist_ok=True)
             write_marker_baselines(self._session_dir, self._session_ts,
                                    self._tracker.baseline_positions_mm)
@@ -2246,12 +2248,16 @@ class SensitivityWindow(ctk.CTk):
 
         # ── Calibration-only mode: save map and return without collecting ─────
         if not self._v4_csv_path:
-            save_dir = os.path.dirname(self._v4_z_thresh_map_path)
-            self._v4_z_thresh_map_path = write_z_thresh_map(
-                save_dir, self._v4_blend_id,
-                float(self._v4_z_step_var.get()),
-                self._v4_z_thresh_map, complete=True,
-            )
+            payload = {
+                "blend_id": self._v4_blend_id,
+                "z_step_mm": float(self._v4_z_step_var.get()),
+                "bins": {str(bid): vals for bid, vals in sorted(self._v4_z_thresh_map.items())},
+                "calibration_complete": True,
+            }
+            tmp = self._v4_z_thresh_map_path + ".tmp"
+            with open(tmp, "w") as _fout:
+                json.dump(payload, _fout, indent=2)
+            os.replace(tmp, self._v4_z_thresh_map_path)
             self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
             self._ender_sync_cmd("M400")
             self._ender_z = _CLEARANCE_Z_MM
@@ -2452,7 +2458,8 @@ class SensitivityWindow(ctk.CTk):
             s_scalar = (d_bar_mean / f_thresh) if f_thresh and not np.isnan(f_thresh) \
                 else float("nan")
 
-            # k nearest markers by Euclidean distance (no rectangular footprint filter).
+            # k nearest markers — exclude markers within _K_BOUNDARY_EXCL_MM of the
+            # working-area edge (mechanically supported, biased response).
             if all_markers is None or all_markers.empty:
                 n_markers_local  = 0
                 d_bar_local_mean = float("nan")
@@ -2460,10 +2467,18 @@ class SensitivityWindow(ctk.CTk):
                 s_local          = float("nan")
                 rep_std_local    = float("nan")
             else:
-                ranked = all_markers.assign(
+                _x_inner = _GRID_7X5_WORK_W_MM / 2 - _K_BOUNDARY_EXCL_MM  # 15.1 mm
+                _y_inner = _GRID_7X5_WORK_H_MM / 2 - _K_BOUNDARY_EXCL_MM  # 11.1 mm
+                _pool = all_markers[
+                    (all_markers["baseline_x_mm"].abs() <= _x_inner) &
+                    (all_markers["baseline_y_mm"].abs() <= _y_inner)
+                ]
+                if len(_pool) < k:
+                    _pool = all_markers  # fallback: too few interior markers
+                ranked = _pool.assign(
                     dist=np.sqrt(
-                        (all_markers["baseline_x_mm"] - x_mm) ** 2 +
-                        (all_markers["baseline_y_mm"] - y_mm) ** 2
+                        (_pool["baseline_x_mm"] - x_mm) ** 2 +
+                        (_pool["baseline_y_mm"] - y_mm) ** 2
                     )
                 ).sort_values("dist")
                 top_k_ids = set(ranked["marker_id"].iloc[:k].tolist())
@@ -2674,7 +2689,7 @@ class SensitivityWindow(ctk.CTk):
             return
         self._st_blend_id = blend_id
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = os.path.join("output", "sessions", f"{ts}_{blend_id}_stability")
+        out_dir = os.path.join("output", "sessions", blend_id, f"{ts}_stability")
         self._st_session_dir = out_dir
         self._st_writer = StabilityWriter(out_dir)
         self._st_hold_means = []
@@ -3029,7 +3044,7 @@ class SensitivityWindow(ctk.CTk):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._hy_blend_id       = blend_id
         self._hy_session_ts     = ts
-        self._hy_session_dir    = f"output/sessions/{ts}_{blend_id}_hysteresis"
+        self._hy_session_dir    = os.path.join("output", "sessions", blend_id, f"{ts}_hysteresis")
         self._hy_z_retract_mm   = z_retract
         self._hy_z_thresh_map   = {int(k): v for k, v in self._v4_z_thresh_map.items()}
         self._hy_bins_completed = []
