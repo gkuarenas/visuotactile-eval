@@ -98,10 +98,8 @@ def generate_figures(session_dir: str, csv_path: str) -> None:
 
     # ── Heatmaps ──────────────────────────────────────────────────────────────
     for key, fname, cmap, title in (
-        ("S_scalar_mm_per_n", f"sensitivity_map{suffix}.png",         "viridis", "S_scalar (mm/N)"),
         ("S_local_mm_per_n",  f"sensitivity_local_map{suffix}.png",   "viridis", "S_local (mm/N)"),
-        ("z_thresh_mm",       f"z_thresh_map{suffix}.png",            "plasma",  "z_thresh (mm)"),
-        ("rep_std_mm",        f"repeatability_map{suffix}.png",       "coolwarm","rep_std (mm)"),
+        ("z_target_mm",       f"z_target_map{suffix}.png",            "plasma",  "z_target (mm)"),
         ("rep_std_local_mm",  f"repeatability_local_map{suffix}.png", "coolwarm","rep_std_local (mm)"),
     ):
         grid_arr = np.full((_GRID_ROWS, _GRID_COLS), np.nan)
@@ -137,8 +135,7 @@ def generate_figures(session_dir: str, csv_path: str) -> None:
     bin_ids = [int(r["bin_id"]) for r in rows]
 
     for y_key, err_key, ylabel, fname_stem, chart_title in (
-        ("S_scalar_mm_per_n", "d_bar_std_mm",       "S_scalar (mm/N)", "sensitivity_bar",       "Per-bin scalar sensitivity (global)"),
-        ("S_local_mm_per_n",  "d_bar_local_std_mm", "S_local (mm/N)",  "sensitivity_local_bar", "Per-bin scalar sensitivity (local)"),
+        ("S_local_mm_per_n",  "d_bar_local_std_mm", "S_local (mm/N)",  "sensitivity_local_bar", "Per-bin sensitivity (|z_target| / f_actual)"),
     ):
         s_vals = [float(r.get(y_key) or 0) for r in rows]
         s_stds = [float(r.get(err_key) or 0) for r in rows]

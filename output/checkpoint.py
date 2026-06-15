@@ -23,6 +23,7 @@ class CheckpointManagerV4:
         completed_collection_reps: dict[str, list[int]],
         csv_path: str,
         summary_csv_path: str,
+        z_target_mm: float = float("nan"),
     ) -> None:
         payload = {
             "session_ts": session_ts,
@@ -34,6 +35,7 @@ class CheckpointManagerV4:
             "completed_collection_reps": completed_collection_reps,
             "csv_path": csv_path,
             "summary_csv_path": summary_csv_path,
+            "z_target_mm": z_target_mm,
         }
         tmp = os.path.join(session_dir, self.TMPFILE)
         os.makedirs(session_dir, exist_ok=True)
@@ -55,15 +57,26 @@ class CheckpointManagerV4:
         if not os.path.isdir(sessions_root):
             return None
         candidates = []
-        for name in os.listdir(sessions_root):
-            if not name.endswith("_sensitivity"):
+        for entry in os.listdir(sessions_root):
+            entry_path = os.path.join(sessions_root, entry)
+            if not os.path.isdir(entry_path):
                 continue
-            folder = os.path.join(sessions_root, name)
-            if not os.path.isdir(folder):
-                continue
-            cp = self.load(folder)
-            if cp is not None and cp.get("phase") != "complete":
-                candidates.append(cp)
+            if entry.endswith("_sensitivity"):
+                # Legacy layout: sessions_root/<timestamp>_sensitivity/
+                cp = self.load(entry_path)
+                if cp is not None and cp.get("phase") != "complete":
+                    candidates.append(cp)
+            else:
+                # New layout: sessions_root/<blend_id>/<timestamp>_sensitivity/
+                for sub in os.listdir(entry_path):
+                    if not sub.endswith("_sensitivity"):
+                        continue
+                    sub_path = os.path.join(entry_path, sub)
+                    if not os.path.isdir(sub_path):
+                        continue
+                    cp = self.load(sub_path)
+                    if cp is not None and cp.get("phase") != "complete":
+                        candidates.append(cp)
         if not candidates:
             return None
         return max(candidates, key=lambda c: c.get("session_ts", ""))
