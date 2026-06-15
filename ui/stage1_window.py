@@ -34,7 +34,7 @@ from output.stage1_writer import (
     write_marker_baselines,
     SensitivityWriterV4, write_sensitivity_summary,
     write_z_thresh_map, load_z_thresh_map,
-    write_idle_noise_csv,
+    write_idle_noise_csv, replace_bin_rows_in_csv,
 )
 import io
 from output.checkpoint import CheckpointManagerV4, CheckpointManagerHysteresis
@@ -47,13 +47,13 @@ from output.hysteresis_writer import HysteresisWriter, write_hysteresis_summary
 STARTUP  = 0
 BASELINE = 1
 
-# v4 protocol states
-V4_CONFIG           = 7
-V4_CALIBRATING      = 8
-V4_CALIBRATION_DONE = 9
-V4_COLLECTING       = 10
-V4_PAUSED           = 11
-V4_COMPLETE         = 12
+# Sensitivity protocol states
+V4_CONFIG      = 7
+V4_CALIBRATING = 8
+V4_COLLECTING  = 10
+V4_PAUSED      = 11
+V4_COMPLETE    = 12
+V4_RERUNNING   = 20
 
 # Hub and inline panel states
 HUB              = 13
@@ -63,17 +63,16 @@ ST_PANEL_DONE    = 16
 HY_PANEL_IDLE    = 17
 HY_PANEL_SWEEPING = 18
 HY_PANEL_DONE    = 19
-V4_RERUNNING     = 20
 
 STATE_NAMES = {
     STARTUP:  "STARTUP",
     BASELINE: "BASELINE",
-    V4_CONFIG:           "V4_CONFIG",
-    V4_CALIBRATING:      "V4_CALIBRATING",
-    V4_CALIBRATION_DONE: "V4_CALIBRATION_DONE",
-    V4_COLLECTING:       "V4_COLLECTING",
-    V4_PAUSED:           "V4_PAUSED",
-    V4_COMPLETE:         "V4_COMPLETE",
+    V4_CONFIG:      "V4_CONFIG",
+    V4_CALIBRATING: "V4_CALIBRATING",
+    V4_COLLECTING:  "V4_COLLECTING",
+    V4_PAUSED:      "V4_PAUSED",
+    V4_COMPLETE:    "V4_COMPLETE",
+    V4_RERUNNING:   "V4_RERUNNING",
     HUB:              "HUB",
     ST_PANEL_IDLE:    "ST_PANEL_IDLE",
     ST_PANEL_RUNNING: "ST_PANEL_RUNNING",
@@ -81,7 +80,6 @@ STATE_NAMES = {
     HY_PANEL_IDLE:     "HY_PANEL_IDLE",
     HY_PANEL_SWEEPING: "HY_PANEL_SWEEPING",
     HY_PANEL_DONE:     "HY_PANEL_DONE",
-    V4_RERUNNING:      "V4_RERUNNING",
 }
 
 _RIGHT_W = 430
@@ -109,8 +107,10 @@ DRIFT_GATE_PX     = 3.0   # max allowed mean per-marker centroid drift before a 
 Z_HARD_LIMIT_MM   = 10.0  # absolute descent depth limit during the ceiling ramp (mm)
 _RAMP_RETRACT_MM  = 1.0   # clearance retracted past the Z=0 contact reference after each ramp
 _TRACKING_LOSS_STRIKES = 3  # consecutive mid-press tracking-loss reps before a bin is skipped
-_COLLECT_PRESS_FEEDRATE    = 150  # mm/min — quasi-static approach, closer to calibration ramp (F100)
-_COLLECT_RETRACT_FEEDRATE  = 300  # mm/min — fast retract, no effect on displacement data
+_COLLECT_PRESS_FEEDRATE    = 300  # mm/min
+_COLLECT_RETRACT_FEEDRATE  = 300  # mm/min
+_V4_Z_RETRACT_MM           = 5.0  # mm — retract clearance after each press
+_V4_DEFAULT_N_PRESSES      = 30   # press repetitions per bin (configurable in UI)
 
 # Load-cell (HX711) telemetry — streamed continuously by a dedicated second
 # Arduino, asynchronously and at a much higher rate than the 30 fps camera.
@@ -279,22 +279,22 @@ class SensitivityWindow(ctk.CTk):
         self._session_dir = ""
         self._session_ts  = ""
 
-        # ── v4 protocol state ─────────────────────────────────────────────
+        # ── Sensitivity protocol state ────────────────────────────────────
         self._checkpoint_v4 = CheckpointManagerV4()
         self._v4_blend_id = ""
         self._v4_sample_n = 1
         self._v4_phase = ""   # "calibration" | "collection" | "complete"
-        self._v4_fixed_z_var: tk.DoubleVar  # initialised in _build_v4_section
-        self._v4_z_thresh_map: dict[int, dict] = {}   # bin_id -> {x_mm,y_mm,z_max_mm,z_thresh_mm,f_max_n,f_thresh_n}
+        self._v4_z_thresh_map: dict[int, dict] = {}
         self._v4_z_thresh_map_path = ""
         self._v4_completed_reps: dict[int, set[int]] = {}
         self._v4_skipped_bins: set[int] = set()
         self._v4_idle_noise: dict[int, tuple[float, float]] = {}
         self._v4_summary_csv_path = ""
         self._v4_csv_path = ""
-        self._v4_resume_checkpoint: Optional[dict] = None
         self._v4_thread: Optional[threading.Thread] = None
         self._writer_v4: Optional[SensitivityWriterV4] = None
+        self._global_z_thresh_mm: float = 0.0
+        self._running_min_z_thresh_mm: float = float("inf")
 
         # State
         self._state = STARTUP
@@ -333,7 +333,6 @@ class SensitivityWindow(ctk.CTk):
         self._hy_per_bin_status: dict[str, dict[str, object]] = {}
 
         self._build_ui()
-        self._check_for_v4_resume()
         self._frame_loop()
         self._ender_process_responses()
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -646,9 +645,12 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkButton(z, text="Home Z", width=bw + 14, command=self._ender_home_z).grid(row=2, column=0, pady=2)
         # Action buttons
         ab = ctk.CTkFrame(f, fg_color="transparent")
-        ab.grid(row=3, column=0, columnspan=6, padx=8, pady=(2, 4), sticky="w")
+        ab.grid(row=3, column=0, columnspan=6, padx=8, pady=(2, 2), sticky="w")
         ctk.CTkButton(ab, text="Capture Origin",   width=130, command=self._on_capture_origin).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(ab, text="Capture Baseline", width=140, command=self._on_capture_baseline).pack(side="left")
+        ctk.CTkButton(ab, text="Capture Baseline", width=140, command=self._on_capture_baseline).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(ab, text="Tare Load Cell", width=120,
+                      fg_color="gray35", hover_color="gray25",
+                      command=self._on_scale_tare).pack(side="left")
         self._jog_status_lbl = ctk.CTkLabel(f, text="", anchor="w")
         self._jog_status_lbl.grid(row=4, column=0, columnspan=6, padx=8, pady=(0, 4), sticky="w")
         return f
@@ -672,65 +674,71 @@ class SensitivityWindow(ctk.CTk):
 
     def _build_v4_section(self, parent) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent)
-        ctk.CTkLabel(f, text="Sensitivity v4", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky="w"
+        ctk.CTkLabel(f, text="Sensitivity", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w"
         )
+
         ctk.CTkLabel(f, text="Blend ID:").grid(row=1, column=0, padx=(8, 2), sticky="e")
         self._v4_blend_id_var = ctk.StringVar(value="")
         ctk.CTkEntry(f, textvariable=self._v4_blend_id_var, width=110).grid(
             row=1, column=1, padx=(0, 8), pady=2, sticky="w"
         )
-        ctk.CTkLabel(f, text="N Reps:").grid(row=1, column=2, padx=(8, 2), sticky="e")
-        self._v4_n_reps_var = tk.IntVar(value=10)
-        ctk.CTkEntry(f, textvariable=self._v4_n_reps_var, width=60).grid(
-            row=1, column=3, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="Z Step (mm):").grid(row=2, column=0, padx=(8, 2), sticky="e")
-        self._v4_z_step_var = tk.DoubleVar(value=0.1)
-        ctk.CTkEntry(f, textvariable=self._v4_z_step_var, width=60).grid(
-            row=2, column=1, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="Z Retract (mm):").grid(row=2, column=2, padx=(8, 2), sticky="e")
-        self._v4_z_retract_var = tk.DoubleVar(value=5.0)
-        ctk.CTkEntry(f, textvariable=self._v4_z_retract_var, width=60).grid(
-            row=2, column=3, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="Sample #:").grid(row=3, column=0, padx=(8, 2), sticky="e")
+        ctk.CTkLabel(f, text="Sample #:").grid(row=1, column=2, padx=(8, 2), sticky="e")
         self._v4_sample_n_var = tk.IntVar(value=1)
         ctk.CTkEntry(f, textvariable=self._v4_sample_n_var, width=60).grid(
-            row=3, column=1, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="Fixed Z (mm):").grid(row=3, column=2, padx=(8, 2), sticky="e")
-        self._v4_fixed_z_var = tk.DoubleVar(value=2.0)
-        ctk.CTkEntry(f, textvariable=self._v4_fixed_z_var, width=60).grid(
-            row=3, column=3, padx=(0, 8), pady=2, sticky="w"
+            row=1, column=3, padx=(0, 8), pady=2, sticky="w"
         )
 
-        br = ctk.CTkFrame(f, fg_color="transparent")
-        br.grid(row=4, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w")
-        self._v4_calib_btn = ctk.CTkButton(br, text="Calibration", width=104, command=self._on_v4_calibration)
-        self._v4_calib_btn.pack(side="left", padx=(0, 6))
-        self._v4_run_btn = ctk.CTkButton(br, text="Run Sensitivity", width=128,
-                                         state="disabled", command=self._on_v4_run_sensitivity)
-        self._v4_run_btn.pack(side="left", padx=(0, 6))
-        self._v4_load_btn = ctk.CTkButton(br, text="Load Calibration", width=128,
-                                          command=self._on_v4_load_calibration)
-        self._v4_load_btn.pack(side="left")
+        ctk.CTkLabel(f, text="N Presses:").grid(row=2, column=0, padx=(8, 2), sticky="e")
+        self._v4_n_presses_var = tk.IntVar(value=_V4_DEFAULT_N_PRESSES)
+        ctk.CTkEntry(f, textvariable=self._v4_n_presses_var, width=60).grid(
+            row=2, column=1, padx=(0, 8), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(f, text="Z Step (mm):").grid(row=2, column=2, padx=(8, 2), sticky="e")
+        self._v4_z_step_var = tk.DoubleVar(value=0.1)
+        ctk.CTkEntry(f, textvariable=self._v4_z_step_var, width=60).grid(
+            row=2, column=3, padx=(0, 8), pady=2, sticky="w"
+        )
+
+        launch_row = ctk.CTkFrame(f, fg_color="transparent")
+        launch_row.grid(row=3, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w")
+        self._v4_start_btn = ctk.CTkButton(
+            launch_row, text="Calibrate & Start Sensitivity", width=210,
+            command=self._on_v4_calibrate_and_start,
+        )
+        self._v4_start_btn.pack(side="left", padx=(0, 6))
+        self._v4_load_session_btn = ctk.CTkButton(
+            launch_row, text="Load Session", width=110,
+            fg_color="gray40", hover_color="gray30",
+            command=self._on_v4_load_session,
+        )
+        self._v4_load_session_btn.pack(side="left")
 
         ctrl_row = ctk.CTkFrame(f, fg_color="transparent")
-        ctrl_row.grid(row=5, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w")
+        ctrl_row.grid(row=4, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w")
         self._v4_pause_btn = ctk.CTkButton(ctrl_row, text="Pause", width=80, state="disabled",
                                            command=self._on_v4_pause)
         self._v4_pause_btn.pack(side="left", padx=(0, 6))
         self._v4_resume_btn = ctk.CTkButton(ctrl_row, text="Resume", width=80, state="disabled",
                                             command=self._on_v4_resume)
         self._v4_resume_btn.pack(side="left", padx=(0, 6))
-        self._v4_return_btn = ctk.CTkButton(
-            ctrl_row, text="Return to Hub", width=110,
+        self._v4_quit_btn = ctk.CTkButton(
+            ctrl_row, text="Quit Sensitivity", width=120,
             fg_color="gray40", hover_color="gray30",
-            state="disabled", command=self._v4_on_return_to_hub,
+            command=self._on_v4_quit_sensitivity,
         )
-        self._v4_return_btn.pack(side="left")
+        self._v4_quit_btn.pack(side="left")
+
+        rerun_row = ctk.CTkFrame(f, fg_color="transparent")
+        rerun_row.grid(row=5, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w")
+        ctk.CTkLabel(rerun_row, text="Re-run Bin:").pack(side="left", padx=(0, 4))
+        self._v4_rerun_bin_var = ctk.StringVar(value="")
+        ctk.CTkEntry(rerun_row, textvariable=self._v4_rerun_bin_var, width=50).pack(side="left", padx=(0, 6))
+        self._v4_rerun_btn = ctk.CTkButton(
+            rerun_row, text="Re-run", width=80, state="disabled",
+            command=self._on_rerun_bin_click,
+        )
+        self._v4_rerun_btn.pack(side="left")
 
         self._v4_progress_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_progress_var, anchor="w",
@@ -751,17 +759,6 @@ class SensitivityWindow(ctk.CTk):
                      font=ctk.CTkFont(family="Courier", size=11)).grid(
             row=9, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
         )
-
-        self._v4_rerun_row = ctk.CTkFrame(f, fg_color="transparent")
-        self._v4_rerun_row.grid(row=10, column=0, columnspan=4, padx=8, pady=(0, 6), sticky="w")
-        ctk.CTkLabel(self._v4_rerun_row, text="Re-run Bin:").pack(side="left", padx=(0, 4))
-        self._v4_rerun_bin_var = ctk.StringVar(value="")
-        ctk.CTkEntry(self._v4_rerun_row, textvariable=self._v4_rerun_bin_var, width=50).pack(side="left", padx=(0, 6))
-        self._v4_rerun_btn = ctk.CTkButton(
-            self._v4_rerun_row, text="Re-run Bin", width=100, state="disabled",
-            command=self._on_rerun_bin_click,
-        )
-        self._v4_rerun_btn.pack(side="left")
 
         return f
 
@@ -942,8 +939,7 @@ class SensitivityWindow(ctk.CTk):
 
     def _apply_visibility(self) -> None:
         s = self._state
-        v4_states = (V4_CONFIG, V4_CALIBRATING, V4_CALIBRATION_DONE,
-                     V4_COLLECTING, V4_PAUSED, V4_COMPLETE, V4_RERUNNING)
+        v4_states = (V4_CONFIG, V4_CALIBRATING, V4_COLLECTING, V4_PAUSED, V4_COMPLETE, V4_RERUNNING)
         st_states = (ST_PANEL_IDLE, ST_PANEL_RUNNING, ST_PANEL_DONE)
         hy_states = (HY_PANEL_IDLE, HY_PANEL_SWEEPING, HY_PANEL_DONE)
 
@@ -966,17 +962,17 @@ class SensitivityWindow(ctk.CTk):
             if visible.get(w, False):
                 w.pack(fill="x", padx=6, pady=3)
 
-        if hasattr(self, "_v4_calib_btn"):
-            self._v4_calib_btn.configure(state="normal" if s == V4_CONFIG else "disabled")
-            self._v4_load_btn.configure(state="normal" if s == V4_CONFIG else "disabled")
-            self._v4_run_btn.configure(
-                state="normal" if s in (V4_CONFIG, V4_CALIBRATION_DONE) and self._v4_calibration_ready()
-                else "disabled"
+        if hasattr(self, "_v4_start_btn"):
+            self._v4_start_btn.configure(state="normal" if s == V4_CONFIG else "disabled")
+            self._v4_load_session_btn.configure(state="normal" if s == V4_CONFIG else "disabled")
+            self._v4_pause_btn.configure(
+                state="normal" if s in (V4_CALIBRATING, V4_COLLECTING, V4_RERUNNING) else "disabled"
             )
-            self._v4_pause_btn.configure(state="normal" if s in (V4_CALIBRATING, V4_COLLECTING, V4_RERUNNING) else "disabled")
             self._v4_resume_btn.configure(state="normal" if s == V4_PAUSED else "disabled")
-            self._v4_return_btn.configure(state="normal" if s in (V4_CONFIG, V4_CALIBRATION_DONE, V4_COMPLETE) else "disabled")
-            self._v4_rerun_btn.configure(state="normal" if s == V4_COMPLETE else "disabled")
+            self._v4_quit_btn.configure(state="normal" if s in v4_states else "disabled")
+            self._v4_rerun_btn.configure(
+                state="normal" if s in (V4_CALIBRATING, V4_COLLECTING, V4_COMPLETE) else "disabled"
+            )
 
         if hasattr(self, "_st_start_btn"):
             self._st_start_btn.configure(state="normal" if s == ST_PANEL_IDLE else "disabled")
@@ -1279,12 +1275,9 @@ class SensitivityWindow(ctk.CTk):
             self._diag_frame = diag
             self._diag_frame_until = time.time() + 3.0
 
-        if self._v4_resume_checkpoint:
-            self._resume_v4_session()
-        else:
-            self._hy_map_info_var.set(f"z_thresh_map: {len(self._v4_z_thresh_map)}/35 bins")
-            self._hy_session_info_var.set(f"Session: {self._session_dir or '—'}")
-            self._set_state(HUB)
+        self._hy_map_info_var.set(f"z_thresh_map: {len(self._v4_z_thresh_map)}/35 bins")
+        self._hy_session_info_var.set(f"Session: {self._session_dir or '—'}")
+        self._set_state(HUB)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Jog panel
@@ -1337,14 +1330,13 @@ class SensitivityWindow(ctk.CTk):
             self._set_state(V4_CALIBRATING)
             self._status_var.set("STATE: V4_CALIBRATING — resumed")
             self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
-        else:
+        elif self._v4_phase == "collection":
             self._set_state(V4_COLLECTING)
             self._status_var.set("STATE: V4_COLLECTING — resumed")
             self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
+        else:
+            return
         self._v4_thread.start()
-
-    def _v4_on_return_to_hub(self) -> None:
-        threading.Thread(target=self._do_return_to_hub, daemon=True).start()
 
     def _do_return_to_hub(self) -> None:
         self._ender_sync_cmd("G90", timeout=10.0)
@@ -1420,7 +1412,7 @@ class SensitivityWindow(ctk.CTk):
         self._arduino_entry.delete(0, "end")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # v4 — small helpers
+    # Sensitivity — helpers
     # ══════════════════════════════════════════════════════════════════════════
 
     def _sanitize_blend_id(self, raw: str) -> str:
@@ -1446,11 +1438,20 @@ class SensitivityWindow(ctk.CTk):
     def _set_v4_progress_fraction(self, frac: float) -> None:
         self.after(0, lambda: self._v4_progress_bar.set(max(0.0, min(1.0, frac))))
 
-    def _v4_calibration_ready(self) -> bool:
-        return len(self._v4_z_thresh_map) == len(GRID_7X5)
+    def _recompute_global_z_thresh(self) -> None:
+        mags = [
+            abs(v["z_max_mm"]) for v in self._v4_z_thresh_map.values()
+            if not v.get("early_stopped") and v.get("z_max_mm") is not None
+        ]
+        if mags:
+            self._global_z_thresh_mm = 0.9 * min(mags)
+            self._running_min_z_thresh_mm = 0.9 * min(mags)
+        else:
+            self._global_z_thresh_mm = 0.0
+            self._running_min_z_thresh_mm = float("inf")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # v4 — frame capture / drift gate (shared by both phases)
+    # Sensitivity — frame capture / drift gate (shared by both phases)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _capture_n_frames(self, n: int, timeout_s: float = 15.0) -> list[tuple[list[MarkerRecord], float]]:
@@ -1588,7 +1589,7 @@ class SensitivityWindow(ctk.CTk):
             },
             csv_path=self._writer_v4.csv_path if self._writer_v4 else "",
             summary_csv_path=self._v4_summary_csv_path,
-            z_target_mm=-abs(float(self._v4_fixed_z_var.get())),
+            z_target_mm=-self._global_z_thresh_mm,
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1621,20 +1622,21 @@ class SensitivityWindow(ctk.CTk):
         ))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # v4 — button handlers
+    # Sensitivity — button handlers
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _on_v4_calibration(self) -> None:
+    def _on_v4_calibrate_and_start(self) -> None:
         if not self._check_com_alive():
-            messagebox.showerror("Not Connected", "Connect the Ender and Arduino before starting calibration.")
+            messagebox.showerror("Not Connected", "Connect the Ender and Arduino before starting.")
             return
         blend_id = self._sanitize_blend_id(self._v4_blend_id_var.get())
         if not blend_id:
-            messagebox.showerror("Input Error", "Enter a Blend ID before starting calibration.")
+            messagebox.showerror("Input Error", "Enter a Blend ID before starting.")
             return
         if not messagebox.askyesno(
-            "Start Calibration",
-            "This will execute automated ceiling ramps at all 35 bins.\n"
+            "Calibrate & Start Sensitivity",
+            "This will run automated ceiling ramps on all 35 bins, then immediately\n"
+            "start sensitivity collection using the minimum z_thresh found.\n\n"
             "Ensure the slab is mounted and the baseline is stable.\n\nProceed?"
         ):
             return
@@ -1642,113 +1644,16 @@ class SensitivityWindow(ctk.CTk):
         self._v4_sample_n = max(1, int(self._v4_sample_n_var.get()))
         self._launch_v4_calibration()
 
-    def _on_v4_run_sensitivity(self) -> None:
-        if not self._check_com_alive():
-            messagebox.showerror("Not Connected", "Connect the Ender and Arduino before starting collection.")
-            return
-        if not self._v4_calibration_ready():
-            messagebox.showerror("Calibration Required", "Run or load a calibration before starting collection.")
-            return
-        blend_id = self._sanitize_blend_id(self._v4_blend_id_var.get()) or self._v4_blend_id
-        if not blend_id:
-            messagebox.showerror("Input Error", "Enter a Blend ID before starting collection.")
-            return
-        self._v4_blend_id = blend_id
-        self._v4_sample_n = max(1, int(self._v4_sample_n_var.get()))
-        self._launch_v4_collection()
-
-    def _on_v4_load_calibration(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Load z_thresh_map.json",
+    def _on_v4_load_session(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Select session folder (contains checkpoint_v4.json)",
             initialdir=os.path.join("output", "sessions"),
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
-        if not path:
+        if not folder:
             return
-        data = load_z_thresh_map(path)
-        if data is None or len(data.get("bins", {})) != len(GRID_7X5):
-            messagebox.showerror(
-                "Load Failed",
-                f"'{os.path.basename(path)}' is not a valid/complete z_thresh_map "
-                f"(expected {len(GRID_7X5)} bins)."
-            )
-            return
-        self._v4_z_thresh_map = data["bins"]
-        self._v4_z_thresh_map_path = path
-        if data.get("blend_id"):
-            self._v4_blend_id = data["blend_id"]
-            self._v4_blend_id_var.set(data["blend_id"])
-        self._set_state(V4_CALIBRATION_DONE)
-        self._populate_v4_calibration_summary()
-        self._status_var.set(f"STATE: V4_CALIBRATION_DONE — loaded {os.path.basename(path)}")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # v4 — launch / resume
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _launch_v4_calibration(self) -> None:
-        self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._session_dir = os.path.join(
-            "output", "sessions", self._v4_blend_id,
-            f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity",
-        )
-        os.makedirs(self._session_dir, exist_ok=True)
-        write_marker_baselines(self._session_dir, self._session_ts,
-                               self._tracker.baseline_positions_mm)
-
-        self._v4_z_thresh_map = {}
-        self._v4_skipped_bins = set()
-        self._v4_completed_reps = {}
-        self._v4_idle_noise = {}
-        self._v4_phase = "calibration"
-        self._session_start_t = time.time()
-        self._pause_event.clear()
-        self._stop_event.clear()
-        self._ender_sync_cmd("G90", timeout=10.0)
-
-        self._set_state(V4_CALIBRATING)
-        self._status_var.set("STATE: V4_CALIBRATING — automated ceiling ramp in progress")
-        self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
-        self._v4_thread.start()
-
-    def _launch_v4_collection(self) -> None:
-        if not self._session_dir:
-            self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._session_dir = os.path.join(
-                "output", "sessions", self._v4_blend_id,
-                f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity",
-            )
-            os.makedirs(self._session_dir, exist_ok=True)
-            write_marker_baselines(self._session_dir, self._session_ts,
-                                   self._tracker.baseline_positions_mm)
-        if self._writer_v4 is None:
-            self._writer_v4 = SensitivityWriterV4(self._session_dir)
-            self._v4_csv_path = self._writer_v4.csv_path
-
-        self._v4_phase = "collection"
-        self._session_start_t = time.time()
-        self._pause_event.clear()
-        self._stop_event.clear()
-        self._ender_sync_cmd("G90", timeout=10.0)
-
-        self._set_state(V4_COLLECTING)
-        self._status_var.set("STATE: V4_COLLECTING — single-press / N-rep collection in progress")
-        self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
-        self._v4_thread.start()
-
-    def _load_resume_z_thresh_map(self, cp: dict) -> None:
-        path = cp.get("z_thresh_map_path", "")
-        data = load_z_thresh_map(path) if path else None
-        if data is not None:
-            self._v4_z_thresh_map = data["bins"]
-            self._v4_z_thresh_map_path = path
-        else:
-            self._v4_z_thresh_map = {}
-            self._v4_z_thresh_map_path = ""
-
-    def _resume_v4_session(self) -> None:
-        cp = self._v4_resume_checkpoint
+        cp = self._checkpoint_v4.load(folder)
         if cp is None:
+            messagebox.showerror("Load Failed", "No valid checkpoint_v4.json found in that folder.")
             return
         self._session_dir = cp["session_dir"]
         self._session_ts  = cp.get("session_ts", "")
@@ -1758,14 +1663,23 @@ class SensitivityWindow(ctk.CTk):
         self._v4_sample_n_var.set(self._v4_sample_n)
         self._v4_phase    = cp.get("phase", "calibration")
         self._v4_summary_csv_path = cp.get("summary_csv_path", "")
-        self._load_resume_z_thresh_map(cp)
-        z_target = cp.get("z_target_mm")
-        if z_target is not None and z_target == z_target:  # not NaN
-            self._v4_fixed_z_var.set(round(abs(z_target), 2))
         self._v4_completed_reps = {
             int(bid): set(reps) for bid, reps in cp.get("completed_collection_reps", {}).items()
         }
-        self._v4_resume_checkpoint = None
+        map_path = cp.get("z_thresh_map_path", "")
+        map_data = load_z_thresh_map(map_path) if map_path else None
+        if map_data is not None:
+            self._v4_z_thresh_map     = map_data["bins"]
+            self._v4_z_thresh_map_path = map_path
+        else:
+            self._v4_z_thresh_map     = {}
+            self._v4_z_thresh_map_path = ""
+        z_target = cp.get("z_target_mm")
+        if z_target is not None and not np.isnan(float(z_target)):
+            self._global_z_thresh_mm = abs(float(z_target))
+        else:
+            self._recompute_global_z_thresh()
+        self._running_min_z_thresh_mm = self._global_z_thresh_mm if self._global_z_thresh_mm > 0.0 else float("inf")
         self._pause_event.clear()
         self._stop_event.clear()
         self._ender_sync_cmd("G90", timeout=10.0)
@@ -1785,21 +1699,76 @@ class SensitivityWindow(ctk.CTk):
             self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
         self._v4_thread.start()
 
-    def _check_for_v4_resume(self) -> None:
-        cp = self._checkpoint_v4.scan_for_resume()
-        if cp is None:
-            return
-        ts     = cp.get("session_ts", "unknown")
-        phase  = cp.get("phase", "unknown")
-        blend  = cp.get("blend_id", "")
-        sample = cp.get("sample_n", 1)
-        if messagebox.askyesno(
-            "Resume v4 Session",
-            f"Incomplete v4 session found:\n  Timestamp: {ts}\n  Blend ID: {blend}\n"
-            f"  Sample #: {sample}\n  Phase: {phase}\n\nResume this session?",
-        ):
-            self._v4_resume_checkpoint = cp
-            self._status_var.set(f"STATE: STARTUP — will resume v4 session {ts} ({phase} phase)")
+    def _on_v4_quit_sensitivity(self) -> None:
+        if self._state in (V4_CALIBRATING, V4_COLLECTING, V4_RERUNNING):
+            if not messagebox.askyesno(
+                "Quit Sensitivity",
+                "A test is currently running. Stop and return to baseline setup?"
+            ):
+                return
+            self._stop_event.set()
+            self._pause_event.set()
+        threading.Thread(target=self._do_quit_to_baseline, daemon=True).start()
+
+    def _do_quit_to_baseline(self) -> None:
+        self._ender_sync_cmd("G90", timeout=10.0)
+        self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
+        self._ender_sync_cmd("M400", timeout=30.0)
+        self._ender_sync_cmd("G1 X0 Y0 F3000", timeout=30.0)
+        self._ender_sync_cmd("M400", timeout=30.0)
+        self._ender_z = _CLEARANCE_Z_MM
+        self._ender_x = 0.0
+        self._ender_y = 0.0
+        self.after(0, self._update_ender_pos_display)
+        self.after(0, lambda: self._set_state(BASELINE))
+        self.after(0, lambda: self._status_var.set("STATE: BASELINE — sensitivity quit; re-calibrate load cell if needed"))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Sensitivity — launch
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _launch_v4_calibration(self) -> None:
+        self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_dir = os.path.join(
+            "output", "sessions", self._v4_blend_id,
+            f"{self._session_ts}_n{self._v4_sample_n}_sensitivity",
+        )
+        os.makedirs(self._session_dir, exist_ok=True)
+        write_marker_baselines(self._session_dir, self._session_ts,
+                               self._tracker.baseline_positions_mm)
+
+        self._v4_z_thresh_map         = {}
+        self._v4_skipped_bins         = set()
+        self._v4_completed_reps       = {}
+        self._v4_idle_noise           = {}
+        self._global_z_thresh_mm      = 0.0
+        self._running_min_z_thresh_mm = float("inf")
+        self._v4_phase = "calibration"
+        self._session_start_t = time.time()
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self._ender_sync_cmd("G90", timeout=10.0)
+
+        self._set_state(V4_CALIBRATING)
+        self._status_var.set("STATE: V4_CALIBRATING — automated ceiling ramp in progress")
+        self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
+        self._v4_thread.start()
+
+    def _launch_v4_collection(self) -> None:
+        if self._writer_v4 is None:
+            self._writer_v4 = SensitivityWriterV4(self._session_dir)
+            self._v4_csv_path = self._writer_v4.csv_path
+
+        self._v4_phase = "collection"
+        self._session_start_t = time.time()
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self._ender_sync_cmd("G90", timeout=10.0)
+
+        self._set_state(V4_COLLECTING)
+        self._status_var.set("STATE: V4_COLLECTING — sensitivity collection in progress")
+        self._v4_thread = threading.Thread(target=self._v4_collection_loop, daemon=True)
+        self._v4_thread.start()
 
     # ══════════════════════════════════════════════════════════════════════════
     # v4 — Phase 1: automated per-bin ceiling ramp (background thread)
@@ -1841,7 +1810,6 @@ class SensitivityWindow(ctk.CTk):
                 ))
                 return
 
-            # Descend to the contact-height reference (Z=0) before ramping
             self._ender_sync_cmd("G1 Z0.000 F300", timeout=10.0)
             self._ender_sync_cmd("M400")
             self._ender_z = 0.0
@@ -1850,6 +1818,7 @@ class SensitivityWindow(ctk.CTk):
             n_baseline = self._capture_tracked_count(3)
             z_current = 0.0
             hit_hard_limit = False
+            hit_early_stop = False
             while True:
                 if self._pause_event.is_set() or self._stop_event.is_set():
                     break
@@ -1860,6 +1829,11 @@ class SensitivityWindow(ctk.CTk):
                 z_current += z_step
                 self._ender_z = -z_current
                 self.after(0, self._update_ender_pos_display)
+
+                running_min = self._running_min_z_thresh_mm
+                if running_min < float("inf") and z_current >= running_min:
+                    hit_early_stop = True
+                    break
 
                 n_current = self._capture_tracked_count(3)
                 if n_current < n_baseline:
@@ -1874,28 +1848,25 @@ class SensitivityWindow(ctk.CTk):
                 self.after(0, self._update_ender_pos_display)
                 break
 
-            capped = hit_hard_limit
             if hit_hard_limit:
-                self.after(0, lambda _b=bin_id: messagebox.showwarning(
-                    "Z Hard Limit Reached",
-                    f"Bin {_b}: descended to the {Z_HARD_LIMIT_MM:.1f} mm hard limit "
-                    f"without losing a marker. Capping z_max at {Z_HARD_LIMIT_MM:.1f} mm "
-                    f"for this bin (true ceiling is >= this value)."
-                ))
                 z_current = Z_HARD_LIMIT_MM
 
-            z_max_mm = -z_current
+            z_max_mm    = -z_current
             z_thresh_mm = 0.90 * z_max_mm
+
+            if not hit_early_stop:
+                thresh_mag = abs(z_thresh_mm)
+                if thresh_mag < self._running_min_z_thresh_mm:
+                    self._running_min_z_thresh_mm = thresh_mag
 
             f_max_g = self._sample_scale_latest()
             if np.isnan(f_max_g):
                 f_max_n: Optional[float] = None
                 f_thresh_n: Optional[float] = None
             else:
-                f_max_n = (f_max_g / 1000.0) * _GRAVITY_MPS2
+                f_max_n    = (f_max_g / 1000.0) * _GRAVITY_MPS2
                 f_thresh_n = 0.90 * f_max_n
 
-            # Retract past the Z=0 contact reference before travelling to the next bin
             self._ender_sync_cmd(f"G1 Z{_RAMP_RETRACT_MM:.3f} F300", timeout=10.0)
             self._ender_sync_cmd("M400")
             self._ender_z = _RAMP_RETRACT_MM
@@ -1906,51 +1877,30 @@ class SensitivityWindow(ctk.CTk):
                 "z_max_mm": round(z_max_mm, 4), "z_thresh_mm": round(z_thresh_mm, 4),
                 "f_max_n": round(f_max_n, 4) if f_max_n is not None else None,
                 "f_thresh_n": round(f_thresh_n, 4) if f_thresh_n is not None else None,
-                "capped": capped,
+                "capped": hit_hard_limit,
+                "early_stopped": hit_early_stop,
             }
             self._write_z_thresh_map_checkpoint(complete=False)
             self._save_v4_checkpoint()
 
         if not self._pause_event.is_set() and not self._stop_event.is_set():
+            self._global_z_thresh_mm = (
+                self._running_min_z_thresh_mm if self._running_min_z_thresh_mm < float("inf") else 0.0
+            )
             self._write_z_thresh_map_checkpoint(complete=True)
             self._v4_phase = "collection"
             self._save_v4_checkpoint()
-            self.after(0, self._on_calibration_complete)
-
-    def _on_calibration_complete(self) -> None:
-        self._set_state(V4_CALIBRATION_DONE)
-        self._update_v4_progress(f"Calibration complete — {len(self._v4_z_thresh_map)}/{len(GRID_7X5)} bins")
-        self._set_v4_progress_fraction(1.0)
-        self._populate_v4_calibration_summary()
-        self._status_var.set("STATE: V4_CALIBRATION_DONE — Run Sensitivity to begin collection")
-
-    def _populate_v4_calibration_summary(self) -> None:
-        bins = self._v4_z_thresh_map
-        if not bins:
-            self._v4_summary_var.set("")
-            return
-        z_threshes = [v["z_thresh_mm"] for v in bins.values() if v.get("z_thresh_mm") is not None]
-        f_threshes = [v["f_thresh_n"] for v in bins.values() if v.get("f_thresh_n") is not None]
-        z_maxes    = [v["z_max_mm"]   for v in bins.values() if v.get("z_max_mm")   is not None]
-        lines = [f"Calibration: {len(bins)}/{len(GRID_7X5)} bins"]
-        if z_threshes:
-            lines.append(f"Z_thresh: mean {sum(z_threshes) / len(z_threshes):.3f} mm   "
-                         f"range [{min(z_threshes):.3f}, {max(z_threshes):.3f}]")
-        if f_threshes:
-            lines.append(f"F_thresh: mean {sum(f_threshes) / len(f_threshes):.4f} N   "
-                         f"range [{min(f_threshes):.4f}, {max(f_threshes):.4f}]")
-        if z_maxes:
-            # max of negatives = shallowest ceiling; 0.9× gives the safe fixed target
-            z_suggested = 0.9 * max(z_maxes)
-            suggested_mag = round(abs(z_suggested), 2)
-            lines.append(f"Suggested fixed depth: {suggested_mag:.2f} mm  (0.9 × shallowest ceiling)")
-            self._v4_fixed_z_var.set(suggested_mag)
-        capped_bins = sorted(bid for bid, v in bins.items() if v.get("capped"))
-        if capped_bins:
-            lines.append(f"Capped at hard limit (lower-bound z_max only): {capped_bins}")
-        if self._v4_skipped_bins:
-            lines.append(f"Skipped bins: {sorted(self._v4_skipped_bins)}")
-        self._v4_summary_var.set("\n".join(lines))
+            n_done = len(self._v4_z_thresh_map)
+            msg = (
+                f"Calibration complete ({n_done}/{len(GRID_7X5)} bins) — "
+                f"global z_thresh = {self._global_z_thresh_mm:.3f} mm — "
+                f"proceeding with sensitivity testing…"
+            )
+            self.after(0, lambda m=msg: self._status_var.set(m))
+            self.after(0, lambda: self._set_v4_progress_fraction(1.0))
+            time.sleep(3.0)
+            if not self._stop_event.is_set():
+                self.after(0, self._launch_v4_collection)
 
     # ══════════════════════════════════════════════════════════════════════════
     # v4 — Phase 2: single-press x N-rep collection (background thread)
@@ -1959,9 +1909,9 @@ class SensitivityWindow(ctk.CTk):
     def _v4_collection_loop(self) -> None:
         bins = [b for b in GRID_7X5 if b["bin_id"] in self._v4_z_thresh_map]
         total = len(bins)
-        n_reps = max(1, int(self._v4_n_reps_var.get()))
-        z_retract = abs(float(self._v4_z_retract_var.get()))
-        z_target_mm = -abs(float(self._v4_fixed_z_var.get()))
+        n_reps = max(1, int(self._v4_n_presses_var.get()))
+        z_retract = _V4_Z_RETRACT_MM
+        z_target_mm = -self._global_z_thresh_mm
 
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
         self._ender_sync_cmd("M400")
@@ -1976,7 +1926,7 @@ class SensitivityWindow(ctk.CTk):
                 "Check the scale COM port and connection, then re-run collection.\n\n"
                 "No hardware has moved — calibration data is safe.",
             ))
-            self.after(0, lambda: self._set_state(V4_CALIBRATION_DONE))
+            self.after(0, lambda: self._set_state(V4_COLLECTING))
             return
 
         for idx, b in enumerate(bins):
@@ -1990,14 +1940,6 @@ class SensitivityWindow(ctk.CTk):
             if bin_id in self._v4_skipped_bins or len(done_reps) >= n_reps:
                 continue
 
-            # Safety guard: skip silently if the fixed target is deeper than this bin's ceiling
-            if z_target_mm < entry["z_max_mm"]:
-                self._v4_skipped_bins.add(bin_id)
-                self._update_v4_progress(
-                    f"Bin {bin_id}: skipped — fixed depth {z_target_mm:.3f} mm "
-                    f"exceeds ceiling {entry['z_max_mm']:.3f} mm"
-                )
-                continue
             if not self._check_com_alive():
                 return
 
@@ -2141,11 +2083,10 @@ class SensitivityWindow(ctk.CTk):
         self._update_v4_progress(f"Collection complete — {len(rows)}/{len(GRID_7X5)} bins")
         self._set_v4_progress_fraction(1.0)
         self._v4_summary_var.set(
-            f"Sensitivity — U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm   "
+            f"z_thresh = {self._global_z_thresh_mm:.3f} mm   "
+            f"U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm\n"
             f"S_global = {g['S_global']:.4f} mm/N   std = {g['S_global_std']:.4f} mm/N   (k={_K_DEFAULT})\n"
-            f"Scalar ref  — U = {g['U_scalar']:.4f}   Rep = {g['Rep_scalar']:.4f} mm   "
-            f"S_mean = {g['S_scalar_mean']:.4f} mm/N   std = {g['S_scalar_std']:.4f} mm/N\n"
-            f"Skipped bins: {sorted(self._v4_skipped_bins) if self._v4_skipped_bins else 'none'}"
+            f"Skipped: {sorted(self._v4_skipped_bins) if self._v4_skipped_bins else 'none'}"
         )
         self._status_var.set("STATE: V4_COMPLETE — sensitivity_summary.csv and figures saved")
 
@@ -2164,32 +2105,40 @@ class SensitivityWindow(ctk.CTk):
         if match is None:
             messagebox.showerror("Invalid Bin", f"Bin {bid} does not exist in the 7×5 grid.")
             return
-        if not messagebox.askyesno(
-            "Re-run Bin",
+        prev_state = self._state
+        calib_only = prev_state == V4_CALIBRATING
+        msg = (
+            f"Re-run bin {bid} (X={match['x_mm']:.3f}, Y={match['y_mm']:.3f})?\n\n"
+            "This will re-do the ceiling ramp for this bin."
+            if calib_only else
             f"Re-run bin {bid} (X={match['x_mm']:.3f}, Y={match['y_mm']:.3f})?\n\n"
             "This will:\n"
             "  1. Re-calibrate the ceiling depth for this bin\n"
-            "  2. Purge the old rows for this bin from the CSV\n"
-            "  3. Collect fresh reps and regenerate the summary\n\n"
-            "The rest of the session data is untouched.",
-        ):
+            "  2. Replace old rows for this bin in the CSV\n"
+            "  3. Collect fresh presses and regenerate the summary"
+        )
+        if not messagebox.askyesno("Re-run Bin", msg):
             return
+        if prev_state in (V4_CALIBRATING, V4_COLLECTING, V4_RERUNNING):
+            self._stop_event.set()
+            self._pause_event.set()
+            if self._v4_thread and self._v4_thread.is_alive():
+                self._v4_thread.join(timeout=10.0)
         self._pause_event.clear()
         self._stop_event.clear()
         self._set_state(V4_RERUNNING)
         self._status_var.set(f"STATE: V4_RERUNNING — re-running bin {bid}")
         self._v4_thread = threading.Thread(
             target=self._v4_rerun_bin_fn,
-            args=(bid, match["x_mm"], match["y_mm"]),
+            args=(bid, match["x_mm"], match["y_mm"], prev_state),
             daemon=True,
         )
         self._v4_thread.start()
 
-    def _v4_rerun_bin_fn(self, bin_id: int, x_mm: float, y_mm: float) -> None:
-        z_step      = abs(float(self._v4_z_step_var.get()))
-        n_reps      = max(1, int(self._v4_n_reps_var.get()))
-        z_retract   = abs(float(self._v4_z_retract_var.get()))
-        z_target_mm = -abs(float(self._v4_fixed_z_var.get()))
+    def _v4_rerun_bin_fn(self, bin_id: int, x_mm: float, y_mm: float, prev_state: int) -> None:
+        z_step    = abs(float(self._v4_z_step_var.get()))
+        n_presses = max(1, int(self._v4_n_presses_var.get()))
+        z_retract = _V4_Z_RETRACT_MM
 
         self._update_v4_progress(f"Re-run bin {bin_id} — moving to clearance")
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
@@ -2212,9 +2161,10 @@ class SensitivityWindow(ctk.CTk):
         self._ender_z = 0.0
         self.after(0, self._update_ender_pos_display)
 
-        n_baseline   = self._capture_tracked_count(3)
-        z_current    = 0.0
-        hit_hard_limit = False
+        n_baseline      = self._capture_tracked_count(3)
+        z_current       = 0.0
+        hit_hard_limit  = False
+        hit_early_stop  = False
         while True:
             if self._stop_event.is_set():
                 break
@@ -2225,6 +2175,12 @@ class SensitivityWindow(ctk.CTk):
             z_current += z_step
             self._ender_z = -z_current
             self.after(0, self._update_ender_pos_display)
+
+            running_min = self._running_min_z_thresh_mm
+            if running_min < float("inf") and z_current >= running_min:
+                hit_early_stop = True
+                break
+
             n_current = self._capture_tracked_count(3)
             if n_current < n_baseline:
                 break
@@ -2246,7 +2202,7 @@ class SensitivityWindow(ctk.CTk):
         z_thresh_mm = 0.90 * z_max_mm
         f_max_g     = self._sample_scale_latest()
         if np.isnan(f_max_g):
-            f_max_n:   Optional[float] = None
+            f_max_n: Optional[float]    = None
             f_thresh_n: Optional[float] = None
         else:
             f_max_n    = (f_max_g / 1000.0) * _GRAVITY_MPS2
@@ -2263,29 +2219,30 @@ class SensitivityWindow(ctk.CTk):
             "f_max_n": round(f_max_n, 4) if f_max_n is not None else None,
             "f_thresh_n": round(f_thresh_n, 4) if f_thresh_n is not None else None,
             "capped": hit_hard_limit,
+            "early_stopped": hit_early_stop,
         }
+        if not hit_early_stop:
+            self._recompute_global_z_thresh()
+        self._write_z_thresh_map_checkpoint(complete=False)
 
-        # Safety guard: if fixed target is deeper than this bin's new ceiling, bail out
-        if z_target_mm < z_max_mm:
-            self._update_v4_progress(
-                f"Re-run bin {bin_id}: fixed depth {z_target_mm:.3f} mm exceeds "
-                f"ceiling {z_max_mm:.3f} mm — bin skipped"
-            )
-            self._v4_skipped_bins.add(bin_id)
-            self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
-            self._ender_z = _CLEARANCE_Z_MM
-            self.after(0, self._update_ender_pos_display)
-            self.after(0, lambda: self._set_state(V4_COMPLETE))
+        # ── If re-run was triggered mid-calibration, restart calibration loop ─
+        if prev_state == V4_CALIBRATING:
+            self._v4_completed_reps.pop(bin_id, None)
+            self._pause_event.clear()
+            self._stop_event.clear()
+            self.after(0, lambda: self._set_state(V4_CALIBRATING))
+            self.after(0, lambda: self._status_var.set(
+                f"STATE: V4_CALIBRATING — resuming after re-run of bin {bin_id}"
+            ))
+            self._v4_thread = threading.Thread(target=self._v4_calibration_loop, daemon=True)
+            self._v4_thread.start()
             return
 
-        # ── Purge old rows for this bin ───────────────────────────────────────
+        # ── For collection / complete: purge CSV + collect fresh presses ──────
         if self._v4_csv_path and os.path.exists(self._v4_csv_path):
-            self._update_v4_progress(f"Re-run bin {bin_id} — purging old rows from CSV")
-            df_all  = pd.read_csv(self._v4_csv_path)
-            df_kept = df_all[df_all["bin_id"] != bin_id]
-            df_kept.to_csv(self._v4_csv_path, index=False)
+            self._update_v4_progress(f"Re-run bin {bin_id} — replacing old rows in CSV")
+            replace_bin_rows_in_csv(self._v4_csv_path, bin_id)
 
-        # ── Re-tare + idle noise ──────────────────────────────────────────────
         self._retare_scale_if_connected()
         mu_idle, sigma_idle = self._capture_idle_noise(x_mm, y_mm)
         self._v4_idle_noise[bin_id] = (mu_idle, sigma_idle)
@@ -2294,13 +2251,14 @@ class SensitivityWindow(ctk.CTk):
             self.after(0, lambda: self._set_state(V4_COMPLETE))
             return
 
-        writer = SensitivityWriterV4(self._session_dir, csv_path=self._v4_csv_path)
-        n_baseline      = self._capture_tracked_count(3)
-        consecutive_failures = 0
-        f_thresh_val    = f_thresh_n if f_thresh_n is not None else float("nan")
+        writer         = SensitivityWriterV4(self._session_dir, csv_path=self._v4_csv_path)
+        n_baseline     = self._capture_tracked_count(3)
+        consec_fail    = 0
+        z_target_mm    = -self._global_z_thresh_mm
+        f_thresh_val   = f_thresh_n if f_thresh_n is not None else float("nan")
+        done_reps: set[int] = set()
 
-        # ── Collection reps ───────────────────────────────────────────────────
-        for rep in range(1, n_reps + 1):
+        for rep in range(1, n_presses + 1):
             if self._stop_event.is_set():
                 break
             while self._pause_event.is_set() and not self._stop_event.is_set():
@@ -2308,7 +2266,7 @@ class SensitivityWindow(ctk.CTk):
             if self._stop_event.is_set():
                 break
 
-            self._update_v4_progress(f"Re-run bin {bin_id} — rep {rep}/{n_reps}")
+            self._update_v4_progress(f"Re-run bin {bin_id} — press {rep}/{n_presses}")
             self._ender_sync_cmd(f"G1 Z{z_target_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}")
             self._ender_sync_cmd("M400")
             self._ender_z = z_target_mm
@@ -2335,22 +2293,23 @@ class SensitivityWindow(ctk.CTk):
             self._recording_active.clear()
 
             time.sleep(_Z_SETTLE_S)
-            f_actual_g = self._sample_scale_latest()
-            f_actual_n = (f_actual_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_actual_g) else float("nan")
+            f_actual_g   = self._sample_scale_latest()
+            f_actual_n_v = (f_actual_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_actual_g) else float("nan")
 
             self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F{_COLLECT_RETRACT_FEEDRATE}")
             self._ender_sync_cmd("M400")
             self._ender_z = z_retract
             self.after(0, self._update_ender_pos_display)
+            time.sleep(_Z_SETTLE_S)
 
             if mid_loss:
-                consecutive_failures += 1
-                if consecutive_failures >= _TRACKING_LOSS_STRIKES:
+                consec_fail += 1
+                if consec_fail >= _TRACKING_LOSS_STRIKES:
                     break
                 continue
 
-            consecutive_failures = 0
-            if np.isnan(f_actual_n):
+            consec_fail = 0
+            if np.isnan(f_actual_n_v):
                 continue
 
             with self._frame_lock:
@@ -2359,11 +2318,13 @@ class SensitivityWindow(ctk.CTk):
                 writer.buffer_frame(
                     records, frame_idx, ts,
                     bin_id, x_mm, y_mm, rep,
-                    z_target_mm, f_thresh_val, f_actual_n,
+                    z_target_mm, f_thresh_val, f_actual_n_v,
                 )
             writer.flush_bin()
+            done_reps.add(rep)
 
         writer.close()
+        self._v4_completed_reps[bin_id] = done_reps
 
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
         self._ender_sync_cmd("M400")
@@ -2382,11 +2343,10 @@ class SensitivityWindow(ctk.CTk):
         self._update_v4_progress(f"Re-run complete — {len(rows)}/{len(GRID_7X5)} bins in summary")
         self._set_v4_progress_fraction(1.0)
         self._v4_summary_var.set(
-            f"Sensitivity — U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm   "
+            f"z_thresh = {self._global_z_thresh_mm:.3f} mm   "
+            f"U = {g['U']:.4f}   Rep = {g['Rep']:.4f} mm\n"
             f"S_global = {g['S_global']:.4f} mm/N   std = {g['S_global_std']:.4f} mm/N   (k={_K_DEFAULT})\n"
-            f"Scalar ref  — U = {g['U_scalar']:.4f}   Rep = {g['Rep_scalar']:.4f} mm   "
-            f"S_mean = {g['S_scalar_mean']:.4f} mm/N   std = {g['S_scalar_std']:.4f} mm/N\n"
-            f"Skipped bins: {sorted(self._v4_skipped_bins) if self._v4_skipped_bins else 'none'}"
+            f"Skipped: {sorted(self._v4_skipped_bins) if self._v4_skipped_bins else 'none'}"
         )
         self._status_var.set("STATE: V4_COMPLETE — re-run complete, summary updated")
 
@@ -2395,7 +2355,7 @@ class SensitivityWindow(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _compute_v4_metrics(self, k_override: Optional[int] = None) -> list[dict]:
-        z_target_mm = -abs(float(self._v4_fixed_z_var.get()))
+        z_target_mm = -self._global_z_thresh_mm
         df: Optional[pd.DataFrame] = None
         _csv = self._writer_v4.csv_path if self._writer_v4 else self._v4_csv_path
         if _csv and os.path.exists(_csv):
@@ -2431,8 +2391,6 @@ class SensitivityWindow(ctk.CTk):
                     "d_bar_mean_mm": float("nan"),
                     "d_bar_std_mm": float("nan"),
                     "f_actual_mean_n": float("nan"),
-                    "S_scalar_mm_per_n": float("nan"),
-                    "rep_std_mm": float("nan"),
                     "n_reps": 0,
                     "n_markers_local": 0,
                     "d_bar_local_mean_mm": float("nan"),
@@ -2454,8 +2412,8 @@ class SensitivityWindow(ctk.CTk):
                     "n_markers": 0, "z_target_mm": round(z_target_mm, 4),
                     "f_thresh_n": float("nan"),
                     "d_bar_mean_mm": float("nan"), "d_bar_std_mm": float("nan"),
-                    "f_actual_mean_n": float("nan"), "S_scalar_mm_per_n": float("nan"),
-                    "rep_std_mm": float("nan"), "n_reps": 0, "n_markers_local": 0,
+                    "f_actual_mean_n": float("nan"),
+                    "n_reps": 0, "n_markers_local": 0,
                     "d_bar_local_mean_mm": float("nan"), "d_bar_local_std_mm": float("nan"),
                     "S_local_mm_per_n": float("nan"), "rep_std_local_mm": float("nan"),
                 })
@@ -2473,9 +2431,6 @@ class SensitivityWindow(ctk.CTk):
             f_actual_mean = float(np.nanmean(per_rep["f_actual"].to_numpy(dtype=float)))
             d_bar_mean = float(np.mean(d_all))
             d_bar_std = float(np.std(d_all))
-            rep_std = float(np.std(d_bar_values))
-            s_scalar = (d_bar_mean / f_actual_mean
-                        if f_actual_mean and not np.isnan(f_actual_mean) else float("nan"))
 
             # k nearest markers by Euclidean distance — IDs selected geometrically
             # from all_markers (full dataset); bin_df is already autofill-filtered
@@ -2510,7 +2465,7 @@ class SensitivityWindow(ctk.CTk):
                     d_bar_local_mean = float(np.mean(d_local_all))
                     d_bar_local_std  = float(np.std(d_local_all))
                     rep_std_local    = float(np.std(per_rep_local["d_bar"].to_numpy(dtype=float)))
-                    s_local          = (d_bar_local_mean / f_actual_mean
+                    s_local          = (abs(z_target_mm) / f_actual_mean
                                         if f_actual_mean and not np.isnan(f_actual_mean) else float("nan"))
                     n_markers_local  = int(topk_df["marker_id"].nunique())
 
@@ -2525,8 +2480,6 @@ class SensitivityWindow(ctk.CTk):
                 "d_bar_mean_mm": round(d_bar_mean, 4),
                 "d_bar_std_mm": round(d_bar_std, 4),
                 "f_actual_mean_n": round(f_actual_mean, 4),
-                "S_scalar_mm_per_n": round(s_scalar, 6) if not np.isnan(s_scalar) else float("nan"),
-                "rep_std_mm": round(rep_std, 4),
                 "n_reps": int(len(per_rep)),
                 "n_markers_local": n_markers_local,
                 "d_bar_local_mean_mm": round(d_bar_local_mean, 4) if not np.isnan(d_bar_local_mean) else float("nan"),
@@ -2545,21 +2498,13 @@ class SensitivityWindow(ctk.CTk):
             u = (1.0 / (1.0 + sig / abs(mu))) if v.size and mu != 0 else float("nan")
             return mu, sig, u
 
-        # Primary (Taceva): global = mean of per-bin local sensitivities
         mu_l, sig_l, u_l = _stats("S_local_mm_per_n")
         rep_local = np.array([r["rep_std_local_mm"] for r in rows], dtype=float)
         rep_local = rep_local[~np.isnan(rep_local)]
         rep_l = float(np.mean(rep_local)) if rep_local.size else float("nan")
 
-        # Reference: scalar (all-marker average, kept for cross-method comparison)
-        mu, sigma, u = _stats("S_scalar_mm_per_n")
-        rep_vals = np.array([r["rep_std_mm"] for r in rows], dtype=float)
-        rep_vals = rep_vals[~np.isnan(rep_vals)]
-        rep = float(np.mean(rep_vals)) if rep_vals.size else float("nan")
-
         return {
             "U": u_l, "Rep": rep_l, "S_global": mu_l, "S_global_std": sig_l,
-            "U_scalar": u, "Rep_scalar": rep, "S_scalar_mean": mu, "S_scalar_std": sigma,
         }
 
     def _generate_v4_figures(self, rows: list[dict]) -> None:
@@ -2576,10 +2521,8 @@ class SensitivityWindow(ctk.CTk):
             return arr
 
         for key, fname, cmap in (
-            ("S_scalar_mm_per_n", f"sensitivity_map{suffix}.png",         "viridis"),
             ("S_local_mm_per_n",  f"sensitivity_local_map{suffix}.png",   "viridis"),
             ("z_target_mm",       f"z_target_map{suffix}.png",            "plasma"),
-            ("rep_std_mm",        f"repeatability_map{suffix}.png",       "coolwarm"),
             ("rep_std_local_mm",  f"repeatability_local_map{suffix}.png", "coolwarm"),
         ):
             fig, ax = plt.subplots()
@@ -2594,8 +2537,7 @@ class SensitivityWindow(ctk.CTk):
         bin_ids = [r["bin_id"] for r in rows]
 
         for y_key, err_key, ylabel, fname_stem, title_label in (
-            ("S_scalar_mm_per_n", "d_bar_std_mm",       "S_scalar (mm/N)", "sensitivity_bar",       "Per-bin scalar sensitivity (global)"),
-            ("S_local_mm_per_n",  "d_bar_local_std_mm", "S_local (mm/N)",  "sensitivity_local_bar", "Per-bin scalar sensitivity (local)"),
+            ("S_local_mm_per_n",  "d_bar_local_std_mm", "S_local (mm/N)",  "sensitivity_local_bar", "Per-bin sensitivity (|z_target| / f_actual)"),
         ):
             s_vals = [r[y_key]   for r in rows]
             s_stds = [r[err_key] for r in rows]

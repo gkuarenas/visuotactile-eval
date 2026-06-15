@@ -204,7 +204,7 @@ SENSITIVITY_SUMMARY_COLUMNS = [
     "bin_id", "bin_x_mm", "bin_y_mm", "n_markers",
     "z_target_mm", "f_thresh_n",
     "d_bar_mean_mm", "d_bar_std_mm", "f_actual_mean_n",
-    "S_scalar_mm_per_n", "rep_std_mm", "n_reps",
+    "n_reps",
     "n_markers_local",
     "d_bar_local_mean_mm", "d_bar_local_std_mm",
     "S_local_mm_per_n", "rep_std_local_mm",
@@ -280,3 +280,9 @@ def load_z_thresh_map(path: str) -> dict | None:
         return data
     except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, TypeError):
         return None
+
+
+def replace_bin_rows_in_csv(csv_path: str, bin_id: int) -> None:
+    import pandas as pd
+    df = pd.read_csv(csv_path)
+    df[df["bin_id"] != bin_id].to_csv(csv_path, index=False)

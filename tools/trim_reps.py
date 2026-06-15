@@ -99,8 +99,6 @@ def compute_summary(df: pd.DataFrame,
                 "d_bar_mean_mm": float("nan"),
                 "d_bar_std_mm": float("nan"),
                 "f_actual_mean_n": float("nan"),
-                "S_scalar_mm_per_n": float("nan"),
-                "rep_std_mm": float("nan"),
                 "n_reps": 0,
                 "n_markers_local": 0,
                 "d_bar_local_mean_mm": float("nan"),
@@ -120,8 +118,6 @@ def compute_summary(df: pd.DataFrame,
         d_bar_mean = float(np.mean(d_all))
         d_bar_std = float(np.std(d_all))
         f_actual_mean = float(np.nanmean(per_rep["f_actual"].to_numpy(dtype=float)))
-        rep_std = float(np.std(per_rep["d_bar"].to_numpy(dtype=float)))
-        s_scalar = (d_bar_mean / f_thresh) if f_thresh and not np.isnan(f_thresh) else float("nan")
 
         ranked = all_markers.assign(
             dist=np.sqrt(
@@ -146,8 +142,9 @@ def compute_summary(df: pd.DataFrame,
             d_bar_local_mean = float(np.mean(d_local_all))
             d_bar_local_std = float(np.std(d_local_all))
             rep_std_local = float(np.std(per_rep_local["d_bar"].to_numpy(dtype=float)))
-            s_local = (d_bar_local_mean / f_thresh
-                       if f_thresh and not np.isnan(f_thresh) else float("nan"))
+            z_target_mm = float(entry["z_thresh_mm"])
+            s_local = (abs(z_target_mm) / f_actual_mean
+                       if f_actual_mean and not np.isnan(f_actual_mean) else float("nan"))
             n_markers_local = int(topk_df["marker_id"].nunique())
 
         rows.append({
@@ -160,8 +157,6 @@ def compute_summary(df: pd.DataFrame,
             "d_bar_mean_mm": round(d_bar_mean, 4),
             "d_bar_std_mm": round(d_bar_std, 4),
             "f_actual_mean_n": round(f_actual_mean, 4),
-            "S_scalar_mm_per_n": round(s_scalar, 6) if not np.isnan(s_scalar) else float("nan"),
-            "rep_std_mm": round(rep_std, 4),
             "n_reps": int(len(per_rep)),
             "n_markers_local": n_markers_local,
             "d_bar_local_mean_mm": round(d_bar_local_mean, 4) if not np.isnan(d_bar_local_mean) else float("nan"),
