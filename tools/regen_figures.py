@@ -100,7 +100,7 @@ def generate_figures(session_dir: str, csv_path: str) -> None:
     for key, fname, cmap, title in (
         ("S_scalar_mm_per_n", f"sensitivity_map{suffix}.png",         "viridis", "S_scalar (mm/N)"),
         ("S_local_mm_per_n",  f"sensitivity_local_map{suffix}.png",   "viridis", "S_local (mm/N)"),
-        ("z_thresh_mm",       f"z_thresh_map{suffix}.png",            "plasma",  "z_thresh (mm)"),
+        ("z_target_mm",       f"z_target_map{suffix}.png",            "plasma",  "z_target (mm)"),
         ("rep_std_mm",        f"repeatability_map{suffix}.png",       "coolwarm","rep_std (mm)"),
         ("rep_std_local_mm",  f"repeatability_local_map{suffix}.png", "coolwarm","rep_std_local (mm)"),
     ):

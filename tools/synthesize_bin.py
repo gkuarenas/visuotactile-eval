@@ -29,7 +29,7 @@ import pandas as pd
 
 # Columns whose values are interpolated from neighbours.
 _INTERP_COLS = [
-    "z_thresh_mm",
+    "z_target_mm",
     "f_thresh_n",
     "d_bar_mean_mm",
     "d_bar_std_mm",
@@ -116,10 +116,10 @@ def synthesize(session_dir: str, bin_id: int, k: int = 4) -> str:
     print(f"\nNeighbours used (k={k}):")
     for _, row in neighbours.iterrows():
         print(f"  bin {int(row['bin_id']):2d}  dist={row['_dist']:.2f} mm  "
-              f"z_thresh={row['z_thresh_mm']:.2f}  f_thresh={row['f_thresh_n']:.4f}  "
+              f"z_target={row['z_target_mm']:.2f}  f_thresh={row['f_thresh_n']:.4f}  "
               f"d_bar_local={row['d_bar_local_mean_mm']:.4f}")
     print(f"\nSynthesized bin {bin_id}:")
-    print(f"  z_thresh_mm       : {float(synth_row['z_thresh_mm']):.4f}  (was {float(target['z_thresh_mm']):.4f})")
+    print(f"  z_target_mm       : {float(synth_row['z_target_mm']):.4f}  (was {float(target['z_target_mm']):.4f})")
     print(f"  f_thresh_n        : {float(synth_row['f_thresh_n']):.4f}  (was {float(target['f_thresh_n']):.4f})")
     print(f"  d_bar_local_mean  : {float(synth_row['d_bar_local_mean_mm']):.4f}  (was {float(target['d_bar_local_mean_mm']):.4f})")
     print(f"  S_local_mm_per_n  : {float(synth_row['S_local_mm_per_n']):.4f}  (was {float(target['S_local_mm_per_n']):.4f})")

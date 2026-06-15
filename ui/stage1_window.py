@@ -284,6 +284,7 @@ class SensitivityWindow(ctk.CTk):
         self._v4_blend_id = ""
         self._v4_sample_n = 1
         self._v4_phase = ""   # "calibration" | "collection" | "complete"
+        self._v4_fixed_z_var: tk.DoubleVar  # initialised in _build_v4_section
         self._v4_z_thresh_map: dict[int, dict] = {}   # bin_id -> {x_mm,y_mm,z_max_mm,z_thresh_mm,f_max_n,f_thresh_n}
         self._v4_z_thresh_map_path = ""
         self._v4_completed_reps: dict[int, set[int]] = {}
@@ -698,6 +699,11 @@ class SensitivityWindow(ctk.CTk):
         self._v4_sample_n_var = tk.IntVar(value=1)
         ctk.CTkEntry(f, textvariable=self._v4_sample_n_var, width=60).grid(
             row=3, column=1, padx=(0, 8), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(f, text="Fixed Z (mm):").grid(row=3, column=2, padx=(8, 2), sticky="e")
+        self._v4_fixed_z_var = tk.DoubleVar(value=2.0)
+        ctk.CTkEntry(f, textvariable=self._v4_fixed_z_var, width=60).grid(
+            row=3, column=3, padx=(0, 8), pady=2, sticky="w"
         )
 
         br = ctk.CTkFrame(f, fg_color="transparent")
@@ -1582,6 +1588,7 @@ class SensitivityWindow(ctk.CTk):
             },
             csv_path=self._writer_v4.csv_path if self._writer_v4 else "",
             summary_csv_path=self._v4_summary_csv_path,
+            z_target_mm=-abs(float(self._v4_fixed_z_var.get())),
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1681,8 +1688,10 @@ class SensitivityWindow(ctk.CTk):
 
     def _launch_v4_calibration(self) -> None:
         self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._session_dir = os.path.join("output", "sessions",
-                                          f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity")
+        self._session_dir = os.path.join(
+            "output", "sessions", self._v4_blend_id,
+            f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity",
+        )
         os.makedirs(self._session_dir, exist_ok=True)
         write_marker_baselines(self._session_dir, self._session_ts,
                                self._tracker.baseline_positions_mm)
@@ -1705,8 +1714,10 @@ class SensitivityWindow(ctk.CTk):
     def _launch_v4_collection(self) -> None:
         if not self._session_dir:
             self._session_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._session_dir = os.path.join("output", "sessions",
-                                              f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity")
+            self._session_dir = os.path.join(
+                "output", "sessions", self._v4_blend_id,
+                f"{self._session_ts}_{self._v4_blend_id}_n{self._v4_sample_n}_sensitivity",
+            )
             os.makedirs(self._session_dir, exist_ok=True)
             write_marker_baselines(self._session_dir, self._session_ts,
                                    self._tracker.baseline_positions_mm)
@@ -1748,6 +1759,9 @@ class SensitivityWindow(ctk.CTk):
         self._v4_phase    = cp.get("phase", "calibration")
         self._v4_summary_csv_path = cp.get("summary_csv_path", "")
         self._load_resume_z_thresh_map(cp)
+        z_target = cp.get("z_target_mm")
+        if z_target is not None and z_target == z_target:  # not NaN
+            self._v4_fixed_z_var.set(round(abs(z_target), 2))
         self._v4_completed_reps = {
             int(bid): set(reps) for bid, reps in cp.get("completed_collection_reps", {}).items()
         }
@@ -1917,6 +1931,7 @@ class SensitivityWindow(ctk.CTk):
             return
         z_threshes = [v["z_thresh_mm"] for v in bins.values() if v.get("z_thresh_mm") is not None]
         f_threshes = [v["f_thresh_n"] for v in bins.values() if v.get("f_thresh_n") is not None]
+        z_maxes    = [v["z_max_mm"]   for v in bins.values() if v.get("z_max_mm")   is not None]
         lines = [f"Calibration: {len(bins)}/{len(GRID_7X5)} bins"]
         if z_threshes:
             lines.append(f"Z_thresh: mean {sum(z_threshes) / len(z_threshes):.3f} mm   "
@@ -1924,6 +1939,12 @@ class SensitivityWindow(ctk.CTk):
         if f_threshes:
             lines.append(f"F_thresh: mean {sum(f_threshes) / len(f_threshes):.4f} N   "
                          f"range [{min(f_threshes):.4f}, {max(f_threshes):.4f}]")
+        if z_maxes:
+            # max of negatives = shallowest ceiling; 0.9× gives the safe fixed target
+            z_suggested = 0.9 * max(z_maxes)
+            suggested_mag = round(abs(z_suggested), 2)
+            lines.append(f"Suggested fixed depth: {suggested_mag:.2f} mm  (0.9 × shallowest ceiling)")
+            self._v4_fixed_z_var.set(suggested_mag)
         capped_bins = sorted(bid for bid, v in bins.items() if v.get("capped"))
         if capped_bins:
             lines.append(f"Capped at hard limit (lower-bound z_max only): {capped_bins}")
@@ -1940,6 +1961,7 @@ class SensitivityWindow(ctk.CTk):
         total = len(bins)
         n_reps = max(1, int(self._v4_n_reps_var.get()))
         z_retract = abs(float(self._v4_z_retract_var.get()))
+        z_target_mm = -abs(float(self._v4_fixed_z_var.get()))
 
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
         self._ender_sync_cmd("M400")
@@ -1962,11 +1984,19 @@ class SensitivityWindow(ctk.CTk):
                 break
             bin_id, x_mm, y_mm = b["bin_id"], b["x_mm"], b["y_mm"]
             entry = self._v4_z_thresh_map[bin_id]
-            z_thresh_mm: float = entry["z_thresh_mm"]
             f_thresh_n: float = entry["f_thresh_n"] if entry.get("f_thresh_n") is not None else float("nan")
 
             done_reps = self._v4_completed_reps.setdefault(bin_id, set())
             if bin_id in self._v4_skipped_bins or len(done_reps) >= n_reps:
+                continue
+
+            # Safety guard: skip silently if the fixed target is deeper than this bin's ceiling
+            if z_target_mm < entry["z_max_mm"]:
+                self._v4_skipped_bins.add(bin_id)
+                self._update_v4_progress(
+                    f"Bin {bin_id}: skipped — fixed depth {z_target_mm:.3f} mm "
+                    f"exceeds ceiling {entry['z_max_mm']:.3f} mm"
+                )
                 continue
             if not self._check_com_alive():
                 return
@@ -2002,10 +2032,10 @@ class SensitivityWindow(ctk.CTk):
 
                 self._update_v4_progress(f"Collection — bin {bin_id}/{total}, rep {rep}/{n_reps}")
 
-                # Press to Z_thresh — absolute move from the G92 contact reference (Z=0)
-                self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}")
+                # Press to fixed target depth — same for all bins and all blends
+                self._ender_sync_cmd(f"G1 Z{z_target_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}")
                 self._ender_sync_cmd("M400")
-                self._ender_z = z_thresh_mm
+                self._ender_z = z_target_mm
                 self.after(0, self._update_ender_pos_display)
                 time.sleep(_Z_SETTLE_S)
                 if self._stop_event.is_set():
@@ -2081,7 +2111,7 @@ class SensitivityWindow(ctk.CTk):
                         self._writer_v4.buffer_frame(
                             records, frame_idx, ts,
                             bin_id, x_mm, y_mm, rep,
-                            z_thresh_mm, f_thresh_n, f_actual_n,
+                            z_target_mm, f_thresh_n, f_actual_n,
                         )
                     self._writer_v4.flush_bin()
 
@@ -2156,9 +2186,10 @@ class SensitivityWindow(ctk.CTk):
         self._v4_thread.start()
 
     def _v4_rerun_bin_fn(self, bin_id: int, x_mm: float, y_mm: float) -> None:
-        z_step    = abs(float(self._v4_z_step_var.get()))
-        n_reps    = max(1, int(self._v4_n_reps_var.get()))
-        z_retract = abs(float(self._v4_z_retract_var.get()))
+        z_step      = abs(float(self._v4_z_step_var.get()))
+        n_reps      = max(1, int(self._v4_n_reps_var.get()))
+        z_retract   = abs(float(self._v4_z_retract_var.get()))
+        z_target_mm = -abs(float(self._v4_fixed_z_var.get()))
 
         self._update_v4_progress(f"Re-run bin {bin_id} — moving to clearance")
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
@@ -2234,6 +2265,19 @@ class SensitivityWindow(ctk.CTk):
             "capped": hit_hard_limit,
         }
 
+        # Safety guard: if fixed target is deeper than this bin's new ceiling, bail out
+        if z_target_mm < z_max_mm:
+            self._update_v4_progress(
+                f"Re-run bin {bin_id}: fixed depth {z_target_mm:.3f} mm exceeds "
+                f"ceiling {z_max_mm:.3f} mm — bin skipped"
+            )
+            self._v4_skipped_bins.add(bin_id)
+            self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+            self._ender_z = _CLEARANCE_Z_MM
+            self.after(0, self._update_ender_pos_display)
+            self.after(0, lambda: self._set_state(V4_COMPLETE))
+            return
+
         # ── Purge old rows for this bin ───────────────────────────────────────
         if self._v4_csv_path and os.path.exists(self._v4_csv_path):
             self._update_v4_progress(f"Re-run bin {bin_id} — purging old rows from CSV")
@@ -2265,9 +2309,9 @@ class SensitivityWindow(ctk.CTk):
                 break
 
             self._update_v4_progress(f"Re-run bin {bin_id} — rep {rep}/{n_reps}")
-            self._ender_sync_cmd(f"G1 Z{z_thresh_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}")
+            self._ender_sync_cmd(f"G1 Z{z_target_mm:.3f} F{_COLLECT_PRESS_FEEDRATE}")
             self._ender_sync_cmd("M400")
-            self._ender_z = z_thresh_mm
+            self._ender_z = z_target_mm
             self.after(0, self._update_ender_pos_display)
             time.sleep(_Z_SETTLE_S)
             if self._stop_event.is_set():
@@ -2315,7 +2359,7 @@ class SensitivityWindow(ctk.CTk):
                 writer.buffer_frame(
                     records, frame_idx, ts,
                     bin_id, x_mm, y_mm, rep,
-                    z_thresh_mm, f_thresh_val, f_actual_n,
+                    z_target_mm, f_thresh_val, f_actual_n,
                 )
             writer.flush_bin()
 
@@ -2351,6 +2395,7 @@ class SensitivityWindow(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _compute_v4_metrics(self, k_override: Optional[int] = None) -> list[dict]:
+        z_target_mm = -abs(float(self._v4_fixed_z_var.get()))
         df: Optional[pd.DataFrame] = None
         _csv = self._writer_v4.csv_path if self._writer_v4 else self._v4_csv_path
         if _csv and os.path.exists(_csv):
@@ -2380,7 +2425,7 @@ class SensitivityWindow(ctk.CTk):
                     "bin_x_mm": round(x_mm, 3),
                     "bin_y_mm": round(y_mm, 3),
                     "n_markers": 0,
-                    "z_thresh_mm": entry["z_thresh_mm"] if entry else float("nan"),
+                    "z_target_mm": round(z_target_mm, 4),
                     "f_thresh_n": (entry.get("f_thresh_n") if entry and entry.get("f_thresh_n") is not None
                                    else float("nan")),
                     "d_bar_mean_mm": float("nan"),
@@ -2398,6 +2443,24 @@ class SensitivityWindow(ctk.CTk):
                 continue
 
             assert bin_df is not None and entry is not None
+            # Exclude autofilled rows — Kalman-predicted displacement is not a
+            # real measurement and would underestimate sensitivity for lost markers.
+            # all_markers (used for k-nearest geometry) is derived from the full df
+            # before this loop, so the k=4 selection is unaffected.
+            bin_df = bin_df[~bin_df["autofilled"]]
+            if bin_df.empty:
+                rows.append({
+                    "bin_id": bin_id, "bin_x_mm": round(x_mm, 3), "bin_y_mm": round(y_mm, 3),
+                    "n_markers": 0, "z_target_mm": round(z_target_mm, 4),
+                    "f_thresh_n": float("nan"),
+                    "d_bar_mean_mm": float("nan"), "d_bar_std_mm": float("nan"),
+                    "f_actual_mean_n": float("nan"), "S_scalar_mm_per_n": float("nan"),
+                    "rep_std_mm": float("nan"), "n_reps": 0, "n_markers_local": 0,
+                    "d_bar_local_mean_mm": float("nan"), "d_bar_local_std_mm": float("nan"),
+                    "S_local_mm_per_n": float("nan"), "rep_std_local_mm": float("nan"),
+                })
+                continue
+
             f_thresh = (float(entry["f_thresh_n"])
                         if entry.get("f_thresh_n") is not None else float("nan"))
 
@@ -2411,10 +2474,12 @@ class SensitivityWindow(ctk.CTk):
             d_bar_mean = float(np.mean(d_all))
             d_bar_std = float(np.std(d_all))
             rep_std = float(np.std(d_bar_values))
-            s_scalar = (d_bar_mean / f_thresh) if f_thresh and not np.isnan(f_thresh) \
-                else float("nan")
+            s_scalar = (d_bar_mean / f_actual_mean
+                        if f_actual_mean and not np.isnan(f_actual_mean) else float("nan"))
 
-            # k nearest markers by Euclidean distance (no rectangular footprint filter).
+            # k nearest markers by Euclidean distance — IDs selected geometrically
+            # from all_markers (full dataset); bin_df is already autofill-filtered
+            # so topk_df inherits that filter automatically.
             if all_markers is None or all_markers.empty:
                 n_markers_local  = 0
                 d_bar_local_mean = float("nan")
@@ -2445,8 +2510,8 @@ class SensitivityWindow(ctk.CTk):
                     d_bar_local_mean = float(np.mean(d_local_all))
                     d_bar_local_std  = float(np.std(d_local_all))
                     rep_std_local    = float(np.std(per_rep_local["d_bar"].to_numpy(dtype=float)))
-                    s_local          = (d_bar_local_mean / f_thresh
-                                        if f_thresh and not np.isnan(f_thresh) else float("nan"))
+                    s_local          = (d_bar_local_mean / f_actual_mean
+                                        if f_actual_mean and not np.isnan(f_actual_mean) else float("nan"))
                     n_markers_local  = int(topk_df["marker_id"].nunique())
 
             rows.append({
@@ -2454,7 +2519,7 @@ class SensitivityWindow(ctk.CTk):
                 "bin_x_mm": round(x_mm, 3),
                 "bin_y_mm": round(y_mm, 3),
                 "n_markers": int(bin_df["marker_id"].nunique()),
-                "z_thresh_mm": round(float(entry["z_thresh_mm"]), 4),
+                "z_target_mm": round(z_target_mm, 4),
                 "f_thresh_n": (round(float(entry["f_thresh_n"]), 4) if entry.get("f_thresh_n") is not None
                                else float("nan")),
                 "d_bar_mean_mm": round(d_bar_mean, 4),
@@ -2513,7 +2578,7 @@ class SensitivityWindow(ctk.CTk):
         for key, fname, cmap in (
             ("S_scalar_mm_per_n", f"sensitivity_map{suffix}.png",         "viridis"),
             ("S_local_mm_per_n",  f"sensitivity_local_map{suffix}.png",   "viridis"),
-            ("z_thresh_mm",       f"z_thresh_map{suffix}.png",            "plasma"),
+            ("z_target_mm",       f"z_target_map{suffix}.png",            "plasma"),
             ("rep_std_mm",        f"repeatability_map{suffix}.png",       "coolwarm"),
             ("rep_std_local_mm",  f"repeatability_local_map{suffix}.png", "coolwarm"),
         ):

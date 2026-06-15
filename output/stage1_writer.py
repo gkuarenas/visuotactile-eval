@@ -123,7 +123,7 @@ class SensitivityWriter:
 
 SENSITIVITY_V4_COLUMNS = [
     "bin_id", "bin_x_mm", "bin_y_mm",
-    "rep", "z_thresh_mm", "f_thresh_n", "f_actual_n",
+    "rep", "z_target_mm", "f_thresh_n", "f_actual_n",
     "frame", "timestamp_ms",
     "marker_id",
     "dx_mm", "dy_mm", "delta_z_mm",
@@ -159,7 +159,7 @@ class SensitivityWriterV4:
         bin_x_mm: float,
         bin_y_mm: float,
         rep: int,
-        z_thresh_mm: float,
+        z_target_mm: float,
         f_thresh_n: float,
         f_actual_n: float,
     ) -> None:
@@ -169,7 +169,7 @@ class SensitivityWriterV4:
                 "bin_x_mm":     round(bin_x_mm, 3),
                 "bin_y_mm":     round(bin_y_mm, 3),
                 "rep":          rep,
-                "z_thresh_mm":  round(z_thresh_mm, 4),
+                "z_target_mm":  round(z_target_mm, 4),
                 "f_thresh_n":   round(f_thresh_n, 4),
                 "f_actual_n":   round(f_actual_n, 4),
                 "frame":        frame_idx,
@@ -202,7 +202,7 @@ class SensitivityWriterV4:
 
 SENSITIVITY_SUMMARY_COLUMNS = [
     "bin_id", "bin_x_mm", "bin_y_mm", "n_markers",
-    "z_thresh_mm", "f_thresh_n",
+    "z_target_mm", "f_thresh_n",
     "d_bar_mean_mm", "d_bar_std_mm", "f_actual_mean_n",
     "S_scalar_mm_per_n", "rep_std_mm", "n_reps",
     "n_markers_local",
