@@ -2498,7 +2498,10 @@ class SensitivityWindow(ctk.CTk):
             d_bar_mean = float(np.mean(d_all))
             d_bar_std = float(np.std(d_all))
             rep_std = float(np.std(d_bar_values))
-            s_scalar = (d_bar_mean / f_thresh) if f_thresh and not np.isnan(f_thresh) \
+            # S = mean(d̄_rep / f_actual_rep) — per-rep ratio avoids ratio-of-means bias.
+            # f_thresh retained in the CSV for reference but is not the divisor.
+            _s_per_rep = per_rep["d_bar"] / per_rep["f_actual"]
+            s_scalar = float(_s_per_rep.mean()) if per_rep["f_actual"].notna().all() \
                 else float("nan")
 
             # k nearest markers — exclude markers within _K_BOUNDARY_EXCL_MM of the
@@ -2536,13 +2539,15 @@ class SensitivityWindow(ctk.CTk):
                 else:
                     per_rep_local    = topk_df.groupby("rep").agg(
                         d_bar=("delta_z_mm", lambda x: np.abs(x).mean()),
+                        f_actual=("f_actual_n", "mean"),
                     )
                     d_local_all      = np.abs(topk_df["delta_z_mm"].to_numpy(dtype=float))
                     d_bar_local_mean = float(np.mean(d_local_all))
                     d_bar_local_std  = float(np.std(d_local_all))
                     rep_std_local    = float(np.std(per_rep_local["d_bar"].to_numpy(dtype=float)))
-                    s_local          = (d_bar_local_mean / f_thresh
-                                        if f_thresh and not np.isnan(f_thresh) else float("nan"))
+                    _s_local_per_rep = per_rep_local["d_bar"] / per_rep_local["f_actual"]
+                    s_local          = float(_s_local_per_rep.mean()) \
+                        if per_rep_local["f_actual"].notna().all() else float("nan")
                     n_markers_local  = int(topk_df["marker_id"].nunique())
 
             rows.append({
