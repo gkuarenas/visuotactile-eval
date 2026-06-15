@@ -1242,7 +1242,7 @@ class SensitivityWindow(ctk.CTk):
         # Disabling auto-exposure also stops the driver's auto-brightness
         # adjustment, which would otherwise drift detection thresholds mid-session.
         self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        self._cap.set(cv2.CAP_PROP_EXPOSURE, -5) 
+        self._cap.set(cv2.CAP_PROP_EXPOSURE, -4) 
 
     # ══════════════════════════════════════════════════════════════════════════
     # BASELINE handlers
