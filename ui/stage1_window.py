@@ -759,7 +759,8 @@ class SensitivityWindow(ctk.CTk):
 
         self._v4_summary_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_summary_var, anchor="w", justify="left",
-                     font=ctk.CTkFont(family="Courier", size=10)).grid(
+                     font=ctk.CTkFont(family="Courier", size=10),
+                     wraplength=_RIGHT_W - 20).grid(
             row=10, column=0, columnspan=2, padx=8, pady=(2, 2), sticky="w"
         )
         self._v4_force_var = ctk.StringVar(value="Force: — g  /  — N")
