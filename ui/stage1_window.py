@@ -970,7 +970,7 @@ class SensitivityWindow(ctk.CTk):
             self._v4_pause_btn.configure(state="normal" if s in (V4_CALIBRATING, V4_COLLECTING, V4_RERUNNING) else "disabled")
             self._v4_resume_btn.configure(state="normal" if s == V4_PAUSED else "disabled")
             self._v4_return_btn.configure(state="normal" if s in (V4_CONFIG, V4_CALIBRATION_DONE, V4_COMPLETE) else "disabled")
-            self._v4_rerun_btn.configure(state="normal" if s == V4_COMPLETE else "disabled")
+            self._v4_rerun_btn.configure(state="normal" if s in (V4_CALIBRATION_DONE, V4_COMPLETE) else "disabled")
 
         if hasattr(self, "_st_start_btn"):
             self._st_start_btn.configure(state="normal" if s == ST_PANEL_IDLE else "disabled")
@@ -2134,14 +2134,24 @@ class SensitivityWindow(ctk.CTk):
         if match is None:
             messagebox.showerror("Invalid Bin", f"Bin {bid} does not exist in the 7×5 grid.")
             return
+        calib_only = not self._v4_csv_path
+        if calib_only:
+            detail = (
+                "This will re-calibrate the ceiling depth for this bin and\n"
+                "overwrite its entry in the saved z_thresh_map JSON.\n\n"
+                "No collection data will be recorded."
+            )
+        else:
+            detail = (
+                "This will:\n"
+                "  1. Re-calibrate the ceiling depth for this bin\n"
+                "  2. Purge the old rows for this bin from the CSV\n"
+                "  3. Collect fresh reps and regenerate the summary\n\n"
+                "The rest of the session data is untouched."
+            )
         if not messagebox.askyesno(
             "Re-run Bin",
-            f"Re-run bin {bid} (X={match['x_mm']:.3f}, Y={match['y_mm']:.3f})?\n\n"
-            "This will:\n"
-            "  1. Re-calibrate the ceiling depth for this bin\n"
-            "  2. Purge the old rows for this bin from the CSV\n"
-            "  3. Collect fresh reps and regenerate the summary\n\n"
-            "The rest of the session data is untouched.",
+            f"Re-run bin {bid} (X={match['x_mm']:.3f}, Y={match['y_mm']:.3f})?\n\n" + detail,
         ):
             return
         self._pause_event.clear()
@@ -2233,6 +2243,21 @@ class SensitivityWindow(ctk.CTk):
             "f_thresh_n": round(f_thresh_n, 4) if f_thresh_n is not None else None,
             "capped": hit_hard_limit,
         }
+
+        # ── Calibration-only mode: save map and return without collecting ─────
+        if not self._v4_csv_path:
+            save_dir = os.path.dirname(self._v4_z_thresh_map_path)
+            self._v4_z_thresh_map_path = write_z_thresh_map(
+                save_dir, self._v4_blend_id,
+                float(self._v4_z_step_var.get()),
+                self._v4_z_thresh_map, complete=True,
+            )
+            self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300")
+            self._ender_sync_cmd("M400")
+            self._ender_z = _CLEARANCE_Z_MM
+            self.after(0, self._update_ender_pos_display)
+            self.after(0, lambda: self._on_rerun_calib_complete(bin_id))
+            return
 
         # ── Purge old rows for this bin ───────────────────────────────────────
         if self._v4_csv_path and os.path.exists(self._v4_csv_path):
@@ -2326,6 +2351,19 @@ class SensitivityWindow(ctk.CTk):
         self._ender_z = _CLEARANCE_Z_MM
         self.after(0, self._update_ender_pos_display)
         self.after(0, self._on_rerun_bin_complete)
+
+    def _on_rerun_calib_complete(self, bin_id: int) -> None:
+        self._populate_v4_calibration_summary()
+        self._set_state(V4_CALIBRATION_DONE)
+        entry = self._v4_z_thresh_map.get(bin_id, {})
+        self._update_v4_progress(
+            f"Calib re-run complete — bin {bin_id}: "
+            f"z_max={entry.get('z_max_mm', '?')} mm, "
+            f"z_thresh={entry.get('z_thresh_mm', '?')} mm"
+        )
+        self._status_var.set(
+            f"STATE: V4_CALIBRATION_DONE — bin {bin_id} re-calibrated, map saved"
+        )
 
     def _on_rerun_bin_complete(self) -> None:
         rows = self._compute_v4_metrics()
