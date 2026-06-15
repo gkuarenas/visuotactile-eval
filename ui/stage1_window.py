@@ -675,36 +675,42 @@ class SensitivityWindow(ctk.CTk):
     def _build_v4_section(self, parent) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent)
         ctk.CTkLabel(f, text="Sensitivity v4", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky="w"
-        )
-        ctk.CTkLabel(f, text="Blend ID:").grid(row=1, column=0, padx=(8, 2), sticky="e")
-        self._v4_blend_id_var = ctk.StringVar(value="")
-        ctk.CTkEntry(f, textvariable=self._v4_blend_id_var, width=110).grid(
-            row=1, column=1, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="N Reps:").grid(row=1, column=2, padx=(8, 2), sticky="e")
-        self._v4_n_reps_var = tk.IntVar(value=10)
-        ctk.CTkEntry(f, textvariable=self._v4_n_reps_var, width=60).grid(
-            row=1, column=3, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="Z Step (mm):").grid(row=2, column=0, padx=(8, 2), sticky="e")
-        self._v4_z_step_var = tk.DoubleVar(value=0.1)
-        ctk.CTkEntry(f, textvariable=self._v4_z_step_var, width=60).grid(
-            row=2, column=1, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="Z Retract (mm):").grid(row=2, column=2, padx=(8, 2), sticky="e")
-        self._v4_z_retract_var = tk.DoubleVar(value=5.0)
-        ctk.CTkEntry(f, textvariable=self._v4_z_retract_var, width=60).grid(
-            row=2, column=3, padx=(0, 8), pady=2, sticky="w"
-        )
-        ctk.CTkLabel(f, text="Sample #:").grid(row=3, column=0, padx=(8, 2), sticky="e")
-        self._v4_sample_n_var = tk.IntVar(value=1)
-        ctk.CTkEntry(f, textvariable=self._v4_sample_n_var, width=60).grid(
-            row=3, column=1, padx=(0, 8), pady=2, sticky="w"
+            row=0, column=0, padx=8, pady=(4, 2), sticky="w"
         )
 
+        # Use inner horizontal frames so labels/entries never clip the right edge.
+        self._v4_blend_id_var          = ctk.StringVar(value="")
+        self._v4_sample_n_var          = tk.IntVar(value=1)
+        self._v4_z_step_var            = tk.DoubleVar(value=0.1)
+        self._v4_n_reps_var            = tk.IntVar(value=10)
+        self._v4_z_retract_var         = tk.DoubleVar(value=5.0)
+        self._v4_z_thresh_override_var = ctk.StringVar(value="")
+
+        row1 = ctk.CTkFrame(f, fg_color="transparent")
+        row1.grid(row=1, column=0, padx=8, pady=2, sticky="w")
+        ctk.CTkLabel(row1, text="Blend ID:").pack(side="left", padx=(0, 2))
+        ctk.CTkEntry(row1, textvariable=self._v4_blend_id_var, width=100).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(row1, text="Sample #:").pack(side="left", padx=(0, 2))
+        ctk.CTkEntry(row1, textvariable=self._v4_sample_n_var, width=55).pack(side="left")
+
+        row2 = ctk.CTkFrame(f, fg_color="transparent")
+        row2.grid(row=2, column=0, padx=8, pady=2, sticky="w")
+        ctk.CTkLabel(row2, text="Z Step (mm):").pack(side="left", padx=(0, 2))
+        ctk.CTkEntry(row2, textvariable=self._v4_z_step_var, width=55).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(row2, text="N Reps:").pack(side="left", padx=(0, 2))
+        ctk.CTkEntry(row2, textvariable=self._v4_n_reps_var, width=55).pack(side="left")
+
+        row3 = ctk.CTkFrame(f, fg_color="transparent")
+        row3.grid(row=3, column=0, padx=8, pady=2, sticky="w")
+        ctk.CTkLabel(row3, text="Z Retract (mm):").pack(side="left", padx=(0, 2))
+        ctk.CTkEntry(row3, textvariable=self._v4_z_retract_var, width=55).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(row3, text="Z Thresh (mm):").pack(side="left", padx=(0, 2))
+        ctk.CTkEntry(row3, textvariable=self._v4_z_thresh_override_var, width=65).pack(side="left")
+        ctk.CTkLabel(row3, text="(blank = calibration)", font=ctk.CTkFont(size=10),
+                     text_color="gray60").pack(side="left", padx=(4, 0))
+
         br = ctk.CTkFrame(f, fg_color="transparent")
-        br.grid(row=4, column=0, columnspan=4, padx=8, pady=(4, 2), sticky="w")
+        br.grid(row=4, column=0, padx=8, pady=(4, 2), sticky="w")
         self._v4_calib_btn = ctk.CTkButton(br, text="Calibration", width=104, command=self._on_v4_calibration)
         self._v4_calib_btn.pack(side="left", padx=(0, 6))
         self._v4_run_btn = ctk.CTkButton(br, text="Run Sensitivity", width=128,
@@ -715,7 +721,7 @@ class SensitivityWindow(ctk.CTk):
         self._v4_load_btn.pack(side="left")
 
         ctrl_row = ctk.CTkFrame(f, fg_color="transparent")
-        ctrl_row.grid(row=5, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w")
+        ctrl_row.grid(row=5, column=0, padx=8, pady=(2, 2), sticky="w")
         self._v4_pause_btn = ctk.CTkButton(ctrl_row, text="Pause", width=80, state="disabled",
                                            command=self._on_v4_pause)
         self._v4_pause_btn.pack(side="left", padx=(0, 6))
@@ -732,25 +738,25 @@ class SensitivityWindow(ctk.CTk):
         self._v4_progress_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_progress_var, anchor="w",
                      font=ctk.CTkFont(family="Courier", size=11), wraplength=_RIGHT_W - 20).grid(
-            row=6, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+            row=6, column=0, padx=8, pady=(2, 2), sticky="w"
         )
         self._v4_progress_bar = ctk.CTkProgressBar(f, width=_RIGHT_W - 60)
         self._v4_progress_bar.set(0.0)
-        self._v4_progress_bar.grid(row=7, column=0, columnspan=4, padx=8, pady=(2, 4), sticky="w")
+        self._v4_progress_bar.grid(row=7, column=0, padx=8, pady=(2, 4), sticky="w")
 
         self._v4_summary_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._v4_summary_var, anchor="w", justify="left",
                      font=ctk.CTkFont(family="Courier", size=10)).grid(
-            row=8, column=0, columnspan=4, padx=8, pady=(2, 2), sticky="w"
+            row=8, column=0, padx=8, pady=(2, 2), sticky="w"
         )
         self._v4_force_var = ctk.StringVar(value="Force: — g  /  — N")
         ctk.CTkLabel(f, textvariable=self._v4_force_var, anchor="w",
                      font=ctk.CTkFont(family="Courier", size=11)).grid(
-            row=9, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w"
+            row=9, column=0, padx=8, pady=(2, 6), sticky="w"
         )
 
         self._v4_rerun_row = ctk.CTkFrame(f, fg_color="transparent")
-        self._v4_rerun_row.grid(row=10, column=0, columnspan=4, padx=8, pady=(0, 6), sticky="w")
+        self._v4_rerun_row.grid(row=10, column=0, padx=8, pady=(0, 6), sticky="w")
         ctk.CTkLabel(self._v4_rerun_row, text="Re-run Bin:").pack(side="left", padx=(0, 4))
         self._v4_rerun_bin_var = ctk.StringVar(value="")
         ctk.CTkEntry(self._v4_rerun_row, textvariable=self._v4_rerun_bin_var, width=50).pack(side="left", padx=(0, 6))
@@ -1974,7 +1980,11 @@ class SensitivityWindow(ctk.CTk):
                 break
             bin_id, x_mm, y_mm = b["bin_id"], b["x_mm"], b["y_mm"]
             entry = self._v4_z_thresh_map[bin_id]
-            z_thresh_mm: float = entry["z_thresh_mm"]
+            _z_ov = self._v4_z_thresh_override_var.get().strip()
+            try:
+                z_thresh_mm: float = float(_z_ov) if _z_ov else entry["z_thresh_mm"]
+            except ValueError:
+                z_thresh_mm: float = entry["z_thresh_mm"]
             f_thresh_n: float = entry["f_thresh_n"] if entry.get("f_thresh_n") is not None else float("nan")
 
             done_reps = self._v4_completed_reps.setdefault(bin_id, set())
