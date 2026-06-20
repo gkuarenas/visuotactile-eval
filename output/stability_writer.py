@@ -61,7 +61,7 @@ class StabilityWriter:
         return self._ts
 
 
-def write_stability_summary_partial(
+def write_stability_summary(
     session_dir: str,
     blend: str,
     session_ts: str,
@@ -73,14 +73,12 @@ def write_stability_summary_partial(
     drift_rate_mm_per_s: float | None = None,
     notes: str = "",
 ) -> str:
-    """Write stability_summary_<blend>.json with the fields the GUI can compute.
+    """Write stability_summary_<blend>.json with all GUI-computable metrics.
 
     drift_0s_mm         — windowed mean of mean_abs_delta_z_mm, frames 0-29 (t=0–1 s)
     drift_3s_mm         — windowed mean of mean_abs_delta_z_mm, frames 75-104 (t=2.5–3.5 s)
-    delta_drift_mm      — |drift_3s_mm - drift_0s_mm|; this is the gate input
+    delta_drift_mm      — |drift_3s_mm - drift_0s_mm|; scoring matrix input for stability
     drift_rate_mm_per_s — linear slope over the full hold (+ = creep, - = relaxation)
-
-    S_at_z_thresh_mm, drift_pct, and gate_pass are left null for offline notebook computation.
     """
     def _r(v, n=6):
         return round(v, n) if v is not None else None
@@ -94,9 +92,6 @@ def write_stability_summary_partial(
         "drift_3s_mm": _r(drift_3s_mm),
         "delta_drift_mm": _r(delta_drift_mm),
         "drift_rate_mm_per_s": _r(drift_rate_mm_per_s),
-        "S_at_z_thresh_mm": None,
-        "drift_pct": None,
-        "gate_pass": None,
         "notes": notes,
     }
     os.makedirs(session_dir, exist_ok=True)
