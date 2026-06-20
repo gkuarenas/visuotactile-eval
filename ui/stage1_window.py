@@ -872,14 +872,19 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkEntry(setup, textvariable=self._hy_blend_var, width=110).grid(
             row=0, column=1, padx=(0, 4), pady=2, sticky="w"
         )
-        ctk.CTkLabel(setup, text="Z Retract (mm):").grid(row=1, column=0, padx=(4, 2), pady=2, sticky="e")
-        self._hy_z_retract_var = ctk.StringVar(value="5.0")
-        ctk.CTkEntry(setup, textvariable=self._hy_z_retract_var, width=70).grid(
+        ctk.CTkLabel(setup, text="Sample #:").grid(row=1, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._hy_sample_var = ctk.StringVar(value="1")
+        ctk.CTkEntry(setup, textvariable=self._hy_sample_var, width=50).grid(
             row=1, column=1, padx=(0, 4), pady=2, sticky="w"
         )
-        ctk.CTkLabel(setup, text="Calib folder:").grid(row=2, column=0, padx=(4, 2), pady=2, sticky="e")
+        ctk.CTkLabel(setup, text="Z Retract (mm):").grid(row=2, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._hy_z_retract_var = ctk.StringVar(value="5.0")
+        ctk.CTkEntry(setup, textvariable=self._hy_z_retract_var, width=70).grid(
+            row=2, column=1, padx=(0, 4), pady=2, sticky="w"
+        )
+        ctk.CTkLabel(setup, text="Calib folder:").grid(row=3, column=0, padx=(4, 2), pady=2, sticky="e")
         calib_row = ctk.CTkFrame(setup, fg_color="transparent")
-        calib_row.grid(row=2, column=1, padx=(0, 4), pady=2, sticky="w")
+        calib_row.grid(row=3, column=1, padx=(0, 4), pady=2, sticky="w")
         self._hy_folder_var = ctk.StringVar(value="")
         ctk.CTkEntry(calib_row, textvariable=self._hy_folder_var, width=160).pack(side="left", padx=(0, 4))
         ctk.CTkButton(calib_row, text="Browse…", width=70,
@@ -888,12 +893,12 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkLabel(setup, textvariable=self._hy_session_info_var,
                      font=ctk.CTkFont(family="Courier", size=10), anchor="w",
                      wraplength=_RIGHT_W - 40).grid(
-            row=3, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w"
+            row=4, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w"
         )
         self._hy_map_info_var = ctk.StringVar(value="z_thresh_map: 0/35 bins")
         ctk.CTkLabel(setup, textvariable=self._hy_map_info_var,
                      font=ctk.CTkFont(family="Courier", size=10), anchor="w").grid(
-            row=4, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w"
+            row=5, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w"
         )
 
         btn_row = ctk.CTkFrame(f, fg_color="transparent")
@@ -2952,6 +2957,13 @@ class SensitivityWindow(ctk.CTk):
             messagebox.showerror("Input Error", "Blend ID is required.")
             return
         try:
+            sample_num = int(self._hy_sample_var.get().strip())
+            if sample_num < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Input Error", "Sample # must be a positive integer.")
+            return
+        try:
             z_retract = float(self._hy_z_retract_var.get())
             if z_retract <= 0:
                 raise ValueError
@@ -2998,7 +3010,7 @@ class SensitivityWindow(ctk.CTk):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._hy_blend_id       = blend_id
         self._hy_session_ts     = ts
-        self._hy_session_dir    = f"output/sessions/{ts}_{blend_id}_hysteresis"
+        self._hy_session_dir    = f"output/sessions/{blend_id}/{ts}_n{sample_num}_hysteresis"
         self._hy_z_retract_mm   = z_retract
         self._hy_z_thresh_map   = {int(k): v for k, v in self._v4_z_thresh_map.items()}
         self._hy_bins_completed = []

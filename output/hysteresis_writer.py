@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import json
 import os
 from datetime import datetime
@@ -95,6 +95,116 @@ class HysteresisWriter:
     @property
     def ts(self) -> str:
         return self._ts
+
+
+def plot_hysteresis_loops(
+    hy_data: dict,
+    blend_order: list,
+    blend_titles: dict,
+    output_path: str,
+    *,
+    fontsize_title: int = 9,
+    fontsize_label: int = 8,
+    fontsize_legend: int = 7,
+    fontsize_tick: int = 6,
+    fontsize_annot: int = 6,
+) -> None:
+    """2×2 hysteresis loop figure — one subplot per blend, one curve set per slab.
+
+    Each slab is drawn in a distinct color: solid = loading ramp, dashed = unloading ramp.
+    The area between the two curves is filled to highlight the hysteresis loop.
+    HI annotation shows mean ± SD across slabs.
+
+    hy_data: {blend_label: [slab_dict, ...]} where each slab_dict comes from
+             _load_hysteresis_slab() in the notebook (keys: load_curves, unload_curves,
+             HI_mean, HI_per_cycle, has_ramp).
+    """
+    import math
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    try:
+        import scienceplots  # noqa: F401
+        plt.style.use(["science", "no-latex"])
+    except Exception:
+        pass
+
+    loaded = [lbl for lbl in blend_order if hy_data.get(lbl)]
+    if not loaded:
+        print("plot_hysteresis_loops: no data loaded.")
+        return
+
+    slab_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    N = len(loaded)
+    ncols = min(N, 2)
+    nrows = math.ceil(N / ncols)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(3.5 * ncols, 3.0 * nrows),
+                             squeeze=False)
+    for idx in range(N, nrows * ncols):
+        axes.flat[idx].set_visible(False)
+
+    for idx, lbl in enumerate(loaded):
+        ax = axes.flat[idx]
+        slabs = hy_data.get(lbl, [])
+        hi_vals = []
+
+        for si, slab in enumerate(slabs):
+            if not slab.get("load_curves") or not slab.get("unload_curves"):
+                continue
+            color = slab_colors[si % len(slab_colors)]
+
+            for ci, (lc, uc) in enumerate(zip(slab["load_curves"], slab["unload_curves"])):
+                lc_s  = lc.sort_values("pen")
+                pen_l = lc_s["pen"].values
+                y_l   = lc_s["mean_abs"].values
+
+                order = np.argsort(uc["pen"].values)
+                pen_u = uc["pen"].values[order]
+                y_u   = uc["mean_abs"].values[order]
+
+                label = f"Slab {si + 1}" if ci == 0 else "_"
+                ax.plot(pen_l, y_l, "-",  color=color, lw=0.8, label=label)
+                ax.plot(pen_u, y_u, "--", color=color, lw=0.8, label="_")
+                ax.fill_between(pen_l, y_l, np.interp(pen_l, pen_u, y_u),
+                                alpha=0.12, color=color)
+
+            hi = slab.get("HI_mean", float("nan"))
+            if not np.isnan(float(hi)):
+                hi_vals.append(float(hi))
+
+        if len(hi_vals) > 1:
+            hi_str = f"HI = {np.mean(hi_vals):.1f} ± {np.std(hi_vals, ddof=1):.1f}%"
+        elif hi_vals:
+            hi_str = f"HI = {hi_vals[0]:.1f}%"
+        else:
+            hi_str = "HI = —"
+
+        ax.text(0.97, 0.05, hi_str,
+                transform=ax.transAxes, ha="right", va="bottom", fontsize=fontsize_annot,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor="none", alpha=0.8))
+        ax.set_title(blend_titles.get(lbl, lbl), fontsize=fontsize_title)
+        ax.set_xlabel("Penetration depth (mm)", fontsize=fontsize_label)
+        ax.set_ylabel(r"Mean $|\Delta z|$ (mm)", fontsize=fontsize_label)
+        ax.tick_params(labelsize=fontsize_tick, direction="in", top=True, right=True)
+
+        slab_handles, slab_labels = ax.get_legend_handles_labels()
+        shown = [(h, l) for h, l in zip(slab_handles, slab_labels) if l != "_"]
+        style_entries = [
+            (Line2D([0], [0], color="black", lw=0.8, ls="-"),  "Loading"),
+            (Line2D([0], [0], color="black", lw=0.8, ls="--"), "Unloading"),
+        ]
+        all_entries = shown + style_entries
+        ax.legend(*zip(*all_entries), fontsize=fontsize_legend, ncol=2)
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    fig.savefig(output_path, dpi=1200, bbox_inches="tight")
+    print(f"Saved: {output_path}")
+    plt.show()
 
 
 def write_hysteresis_summary(

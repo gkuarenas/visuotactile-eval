@@ -1,4 +1,11 @@
-# Methods: Marker Displacement Tracking, Sensitivity Characterization, and Sustained-Load Marker Stability of the GripVT Visuotactile Sensor
+﻿# Methods: Marker Displacement Tracking, Sensitivity Characterization, and Sustained-Load Marker Stability of the GripVT Visuotactile Sensor
+
+> **Legacy document.** This file has been superseded by two canonical replacements:
+> - `methods_marker_detection_pipeline.md` - fisheye undistortion through per-frame Kalman tracking
+> - `methods_stage1_test_protocols_metrics.md` - calibration protocol, collection procedure, and all metric definitions
+>
+> This file is retained for reference. Do not cite it directly in the thesis.
+
 
 ---
 
@@ -336,7 +343,8 @@ The calibration loop visits every bin in boustrophedon order. For each bin, the 
 ```
 Algorithm 2: Automated Ceiling Ramp (per bin)
 ─────────────────────────────────────────────────────
-Input:  Bin centroid (x_mm, y_mm), z_step, hard_limit = 10 mm
+Input:  Bin centroid (x_mm, y_mm), z_step, hard_limit = 10 mm,
+        running_min_z_thresh (updated after each non-early-stopped bin)
 Output: z_thresh_mm, f_thresh_n (saved to z_thresh_map JSON)
 
 1.  Move XY to (x_mm, y_mm) at F=3000 mm/min; wait M400
@@ -350,17 +358,22 @@ Output: z_thresh_mm, f_thresh_n (saved to z_thresh_map JSON)
 7.  loop:
 8.      G91; move Z by -z_step (default 0.1 mm); G90; wait M400
 9.      z_current ← z_current + z_step
-10.     n_current ← mean tracked count over 3 frames
-11.     if n_current < n_baseline: break        // marker lost → ceiling reached
-12.     if z_current > 10.0 mm: capped ← True; break
-13. z_max_mm   ← -z_current
-14. z_thresh_mm ← 0.90 × z_max_mm
-15. f_max_g    ← sample_scale_latest(window = 0.2 s)
-16. f_max_n    ← (f_max_g / 1000) × 9.80665
-17. f_thresh_n ← 0.90 × f_max_n
-18. Retract Z to +1.0 mm (above contact reference)
-19. Save {z_max, z_thresh, f_max, f_thresh} to z_thresh_map[bin_id]
-20. Write z_thresh_map checkpoint (atomic: tmp → os.replace)
+10.     if z_current ≥ running_min_z_thresh:
+            hit_early_stop ← True; break          // early-stop gate
+11.     n_current ← mean tracked count over 3 frames
+12.     if n_current < n_baseline: break           // marker lost → ceiling reached
+13.     if z_current > 10.0 mm: capped ← True; break
+14. z_max_mm   ← -z_current
+15. z_thresh_mm ← 0.90 × z_max_mm  (if not hit_early_stop)
+                 ← -running_min_z_thresh        (if hit_early_stop)
+16. f_max_g    ← sample_scale_latest(window = 0.2 s)
+17. f_max_n    ← (f_max_g / 1000) × 9.80665
+18. f_thresh_n ← 0.90 × f_max_n
+19. Retract Z to +1.0 mm (above contact reference)
+20. if not hit_early_stop:
+        update running_min_z_thresh ← min(running_min_z_thresh, |z_thresh_mm|)
+21. Save {z_max, z_thresh, f_max, f_thresh, early_stopped} to z_thresh_map[bin_id]
+22. Write z_thresh_map checkpoint (atomic: tmp → os.replace)
 ─────────────────────────────────────────────────────
 ```
 
@@ -368,9 +381,17 @@ The descent step $\Delta z_{\text{step}} = 0.1$ mm is configurable. The ceiling 
 
 The 90% threshold rule ($z_{\text{thresh}} = 0.90 \cdot z_{\max}$, $f_{\text{thresh}} = 0.90 \cdot f_{\max}$) ensures the subsequent data collection operates within the elastic regime, below the deformation ceiling. The $z_{\max}$ values vary across bins due to proximity to the rigid boundary edges of the slab, which locally stiffen the elastomer and reduce the achievable indentation depth.
 
+**Early-stop gate.** A secondary descent ceiling is imposed during calibration to enforce the fixed-depth collection invariant (§G). A running minimum, $z_{\text{thresh}}^{\min}$, tracks the smallest $|z_{\text{thresh}}|$ recorded by all bins completed earlier in the calibration sequence. If the current bin's descent reaches $z_{\text{thresh}}^{\min}$ before triggering the marker-loss criterion, descent terminates early: the bin is flagged `early_stopped=True` and its threshold is recorded as $z_{\text{thresh}}^{\min}$ rather than $0.90 \cdot z_{\max}$. Because the subsequent collection phase will press every bin to the same global target depth (§G), there is no benefit to descending a given bin deeper than the shallowest threshold found so far. Early-stopped bins are excluded from the final computation of $z_{\text{target}}$.
+
 A hard descent limit of $z_{\max,\text{hard}} = 10.0$ mm prevents damage in bins where the ceiling is unusually high or the termination criterion is not triggered. Bins hitting this limit are flagged `capped=True` in the calibration output; their $z_{\max}$ values are lower bounds only.
 
-The calibration output is a JSON file (`z_thresh_map_<blend_id>.json`) containing, per bin: $\{x, y, z_{\max}, z_{\text{thresh}}, f_{\max}, f_{\text{thresh}}, \text{capped}\}$. Atomic file writes (`tmp → os.replace`) ensure crash safety.
+After all 35 bins complete the ceiling ramp, the global collection depth is determined as:
+
+$$z_{\text{target}} = \min_{b \in \mathcal{B}_{\text{valid}}} \left| z_{\text{thresh},b} \right|$$
+
+where $\mathcal{B}_{\text{valid}}$ is the set of bins that are neither `early_stopped` nor `capped`. This value, $z_{\text{target}}$, is constant for the entire collection phase and is identical across all 35 bins.
+
+The calibration output is a JSON file (`z_thresh_map_<blend_id>.json`) containing, per bin: $\{x, y, z_{\max}, z_{\text{thresh}}, f_{\max}, f_{\text{thresh}}, \text{capped}, \text{early\_stopped}\}$. Atomic file writes (`tmp → os.replace`) ensure crash safety.
 
 #### F.1 Single-Bin Re-Run Mode
 
@@ -386,17 +407,23 @@ Marker IDs remain unchanged: because IDs are assigned deterministically by posit
 
 ---
 
-### G. Phase 2: Single-Press N-Repetition Data Collection
+### G. Phase 2: Fixed-Depth N-Repetition Data Collection
 
-#### G.1 Collection Procedure
+#### G.1 Fixed Collection Depth
 
-With the calibration threshold map loaded, the collection phase visits each bin and performs $N_{\text{rep}}$ independent press-hold-retract cycles (default $N_{\text{rep}} = 10$). Each cycle proceeds as follows:
+A key design invariant of the collection phase is that every bin — across all 35 spatial locations and all elastomer blends tested in the same session — is pressed to the same absolute indentation depth $z_{\text{target}}$, determined at the end of calibration (§F). This fixed-depth protocol enables direct force comparison across bins: because the pressed depth is held constant, variation in the measured load cell force $f_{\text{actual}}$ reflects the local stiffness of the elastomer at that spatial position, not a confound of different press depths. The sensitivity metric $S_{\text{local}}$ (§I.2) exploits this invariance directly.
+
+The use of a single shared depth also means that no bin is pressed beyond its safe operating limit: the early-stop gate (§F) ensures every bin can reach $z_{\text{target}}$ without triggering marker loss.
+
+#### G.2 Collection Procedure
+
+With the global target depth $z_{\text{target}}$ determined from calibration, the collection phase visits each bin and performs $N_{\text{rep}}$ independent press-hold-retract cycles (default $N_{\text{rep}} = 10$). Each cycle proceeds as follows:
 
 ```
 Algorithm 3: Per-Bin Collection Loop
 ─────────────────────────────────────────────────────
-Input:  Bin centroid (x_mm, y_mm), z_thresh_map entry,
-        N_rep (default 10)
+Input:  Bin centroid (x_mm, y_mm), z_target_mm (global fixed depth),
+        f_thresh_n (per-bin, from z_thresh_map), N_rep (default 10)
 Output: N_rep × 10 frames of MarkerRecord data; f_actual_n per rep
 
 [Per-bin preamble]
@@ -410,7 +437,7 @@ Output: N_rep × 10 frames of MarkerRecord data; f_actual_n per rep
     c.  Store (μ_idle, σ_idle) in idle_noise map for this bin
 
 [Per-rep cycle, repeated N_rep times]
-5.  Move Z to z_thresh_mm (absolute) at F=150 mm/min; wait M400
+5.  Move Z to z_target_mm (global fixed depth, absolute) at F=300 mm/min; wait M400
 6.  Sleep 0.5 s  (settle: flush in-flight frames, dampen ringing)
 7.  Record 10 camera frames into frame_buffer
     → if last frame has fewer than (n_baseline − 1) tracked markers:
@@ -427,15 +454,15 @@ Output: N_rep × 10 frames of MarkerRecord data; f_actual_n per rep
 ─────────────────────────────────────────────────────
 ```
 
-The 0.5-second settle delay before recording flushes camera frames captured during the indenter's descent (which would contain transient ramp-up displacement rather than steady-state held values). A second 0.5-second delay before force sampling allows the viscoelastic elastomer additional time to approach a load plateau. The press feedrate is 150 mm/min to match the calibration ceiling ramp speed, ensuring consistent elastomer response between the two phases.
+The 0.5-second settle delay before recording flushes camera frames captured during the indenter's descent (which would contain transient ramp-up displacement rather than steady-state held values). A second 0.5-second delay before force sampling allows the viscoelastic elastomer additional time to approach a load plateau. The press feedrate is 300 mm/min, consistent with the calibration ceiling ramp speed.
 
 The idle frame capture (steps 3–4) doubles as the post-retare settle: the first 9 discarded frames span $\approx 0.3$ s, replacing the previous hard `sleep(0.3)`. The remaining 21 frames are used for the per-bin noise floor (§G.5). Net added time per bin: $+0.7$ s.
 
-#### G.2 Mid-Press Tracking-Loss Guard
+#### G.3 Mid-Press Tracking-Loss Guard
 
 During recording, the system monitors the live frame buffer. If the most recently buffered frame contains fewer than $n_{\text{baseline}} - 1$ non-autofilled markers, mid-press tracking loss is declared, and the rep is aborted. Three consecutive tracking-loss failures at the same bin trigger bin skipping: the bin is excluded from metric computation and flagged in the output summary.
 
-#### G.3 Frame Buffer and Thread Safety
+#### G.4 Frame Buffer and Thread Safety
 
 The camera feed runs on the Tkinter main thread at ~30 fps. When `recording_active` is set, each processed frame (list of `MarkerRecord` objects + timestamp) is appended to `frame_buffer` under a mutex (`_frame_lock`). The collection background thread reads from this buffer after clearing it at the start of each rep. This producer-consumer design prevents race conditions while keeping the GUI responsive.
 
@@ -461,19 +488,18 @@ Note that the calibration ceiling ramp (§F) still determines $z_{\text{thresh}}
 
 #### G.6 Output Data
 
-Each collection session produces the following files in `output/sessions/<timestamp>_<blend_id>_sensitivity/`:
+Each collection session produces the following files in `output/sessions/<blend_id>/<timestamp>_n<N>_sensitivity/`, where `<blend_id>` is the operator-entered blend identifier and `<N>` is the number of repetitions per bin:
 
 | File | Contents |
 |------|----------|
-| `sensitivity_data_<ts>.csv` | Per-frame, per-marker records: `bin_id, bin_x_mm, bin_y_mm, rep, z_thresh_mm, f_thresh_n, f_actual_n, frame, timestamp_ms, marker_id, dx_mm, dy_mm, delta_z_mm, dA, magnitude_mm, autofilled` |
-| `sensitivity_summary_<blend_id>.csv` | Per-bin aggregated metrics (see §I) |
+| `sensitivity_data_<ts>.csv` | Per-frame, per-marker records: `bin_id, bin_x_mm, bin_y_mm, rep, z_target_mm, f_thresh_n, f_actual_n, frame, timestamp_ms, marker_id, dx_mm, dy_mm, delta_z_mm, dA, magnitude_mm, autofilled` |
+| `sensitivity_summary_<blend_id>.csv` | Per-bin aggregated metrics (see §I); columns: `bin_id, bin_x_mm, bin_y_mm, n_markers, z_target_mm, f_thresh_n, d_bar_mean_mm, d_bar_std_mm, f_actual_mean_n, n_reps, n_markers_local, d_bar_local_mean_mm, d_bar_local_std_mm, S_local_mm_per_n, rep_std_local_mm` |
 | `idle_noise_<blend_id>.csv` | Per-bin idle noise floor: `bin_id, bin_x_mm, bin_y_mm, mu_idle_mm, sigma_idle_mm` |
 | `marker_baselines_<ts>.json` | Baseline $(x_{\text{mm}}, y_{\text{mm}})$ per marker ID |
 | `z_thresh_map_<blend_id>.json` | Per-bin calibration thresholds |
-| `sensitivity_map_<blend_id>.png` | 7×5 heatmap — scalar sensitivity |
-| `sensitivity_local_map_<blend_id>.png` | 7×5 heatmap — local sensitivity |
-| `repeatability_map_<blend_id>.png` | 7×5 heatmap — scalar repeatability |
-| `repeatability_local_map_<blend_id>.png` | 7×5 heatmap — local repeatability |
+| `sensitivity_local_map_<blend_id>.png` | 7×5 heatmap — $S_{\text{local}}$ (mm/N) |
+| `z_target_map_<blend_id>.png` | 7×5 heatmap — collection depth $z_{\text{target}}$ (mm); should be uniform within a session |
+| `repeatability_local_map_<blend_id>.png` | 7×5 heatmap — local repeatability $\sigma_{\text{rep,local}}$ (mm) |
 
 ---
 
@@ -537,7 +563,7 @@ The gate threshold for the stability test is nominally 10% of the mean steady-st
 
 #### H.5 Output Data
 
-Each stability test session produces the following files in `output/sessions/<timestamp>_<blend_id>_stability/`:
+Each stability test session produces the following files in `output/sessions/<blend_id>/<timestamp>_stability/`:
 
 | File | Contents |
 |------|----------|
@@ -550,35 +576,35 @@ The summary JSON is written atomically (`tmp → os.replace`) at session end. A 
 
 ### I. Sensitivity, Repeatability, and Stability Metrics
 
-#### I.1 Per-Bin Scalar Sensitivity (All-Marker Reference)
+#### I.1 Per-Bin Displacement Response (All-Marker Reference)
 
-For bin $b$, the scalar displacement response is the mean z-displacement magnitude over all markers, all frames, and all reps:
+For bin $b$, the all-marker displacement response is the mean z-displacement magnitude over all markers, all frames, and all reps:
 
 $$\bar{d}_{b} = \frac{1}{N_{\text{rep}} \cdot N_{\text{frames}} \cdot N_{\text{markers}}} \sum_{r=1}^{N_{\text{rep}}} \sum_{f=1}^{N_{\text{frames}}} \sum_{i \in \mathcal{M}} |\Delta z_{b,r,f,i}|$$
 
-The scalar sensitivity index is:
-
-$$S_{\text{scalar},b} = \frac{\bar{d}_b}{f_{\text{thresh},b}} \quad \left[\frac{\text{mm}}{\text{N}}\right]$$
-
-where $f_{\text{thresh},b}$ is the bin-specific force threshold determined during calibration. This metric captures the aggregate response of the entire sensor surface to the applied load.
-
-Repeatability is quantified as the standard deviation of per-rep mean magnitudes:
-
-$$\sigma_{\text{rep},b} = \text{std}\!\left(\left\{\bar{d}_{b,r}\right\}_{r=1}^{N_{\text{rep}}}\right), \qquad \bar{d}_{b,r} = \frac{1}{N_{\text{frames}} \cdot N_{\text{markers}}} \sum_{f,i} |\Delta z_{b,r,f,i}|$$
+This quantity $\bar{d}_b$ is retained in the summary CSV (`d_bar_mean_mm`) as a diagnostic for the spatial extent of the deformation field, and is used in the normalised stability gate (§I.4.4). It is not directly used as a sensitivity metric; the primary sensitivity index is the local compliance $S_{\text{local}}$ described in §I.2.
 
 #### I.2 Per-Bin Local Sensitivity ($k$-Nearest Markers)
 
-The all-marker average dilutes the sensitivity signal: markers far from the indenter centre respond weakly, lowering $S_{\text{scalar}}$ and introducing spatial noise. A spatially-resolved local sensitivity metric restricts the displacement average to the $k = 4$ markers geometrically nearest to each bin centroid, using Euclidean distance computed from the marker baseline positions in physical coordinates:
+The all-marker average $\bar{d}_b$ dilutes the sensitivity signal because markers far from the indenter centre respond weakly. A spatially-resolved local sensitivity metric restricts the displacement average to the $k = 4$ markers geometrically nearest to each bin centroid, using Euclidean distance computed from the marker baseline positions in physical coordinates:
 
 $$\mathcal{M}_{b}^{(k)} = \arg\min_{|\mathcal{S}| = k,\ \mathcal{S} \subseteq \mathcal{M}}\  \sum_{i \in \mathcal{S}} \left\| \mathbf{p}_i^{\text{baseline}} - \mathbf{c}_b \right\|_2$$
 
-where $\mathbf{c}_b = (x_b, y_b)^\top$ is the bin centroid in mm and $\mathbf{p}_i^{\text{baseline}}$ is the $i$-th marker's baseline physical position. The local displacement mean and sensitivity are:
+where $\mathbf{c}_b = (x_b, y_b)^\top$ is the bin centroid in mm and $\mathbf{p}_i^{\text{baseline}}$ is the $i$-th marker's baseline physical position. The local displacement mean over all reps and frames is:
 
 $$\bar{d}_{b}^{(k)} = \frac{1}{N_{\text{rep}} \cdot N_{\text{frames}} \cdot k} \sum_{r,f,i \in \mathcal{M}_b^{(k)}} |\Delta z_{b,r,f,i}|$$
 
-$$S_{\text{local},b} = \frac{\bar{d}_{b}^{(k)}}{f_{\text{thresh},b}} \quad \left[\frac{\text{mm}}{\text{N}}\right]$$
+The local sensitivity index is defined as:
 
-Local repeatability:
+$$S_{\text{local},b} = \frac{z_{\text{target}}}{\bar{f}_{\text{actual},b}} \quad \left[\frac{\text{mm}}{\text{N}}\right]$$
+
+where $z_{\text{target}}$ is the fixed collection depth shared across all bins (§G.1) and $\bar{f}_{\text{actual},b}$ is the mean load cell force measured at that depth across all reps for bin $b$:
+
+$$\bar{f}_{\text{actual},b} = \frac{1}{N_{\text{rep}}} \sum_{r=1}^{N_{\text{rep}}} f_{\text{actual},b,r}$$
+
+This formulation models $S_{\text{local}}$ as a compliance: the depth yield per unit applied force. Because $z_{\text{target}}$ is identical for every bin and both blends tested in the same session, inter-bin and inter-blend variation in $S_{\text{local}}$ reflects solely variation in $\bar{f}_{\text{actual}}$ — a stiffer elastomer requires more force to reach the same depth, producing a lower compliance index. This contrasts with the prior formulation ($S = \bar{d}^{(k)} / f_{\text{thresh}}$), which conflated the local displacement response with the per-bin calibration force threshold and was sensitive to variation in both.
+
+Local repeatability is the standard deviation of per-rep local displacement means:
 
 $$\sigma_{\text{rep,local},b} = \text{std}\!\left(\left\{\bar{d}_{b,r}^{(k)}\right\}_{r=1}^{N_{\text{rep}}}\right)$$
 
@@ -594,7 +620,7 @@ Spatial uniformity is expressed as a normalized index bounded in $(0, 1]$:
 
 $$U = \frac{1}{1 + \sigma_{\text{global}} / |S_{\text{global}}|}$$
 
-$U = 1$ indicates a perfectly uniform response across all bins; lower values reflect spatial variation. The same form is computed for the scalar reference metric ($U_{\text{scalar}}$, $S_{\text{scalar,mean}}$).
+$U = 1$ indicates a perfectly uniform response across all bins; lower values reflect spatial variation.
 
 Global repeatability is the mean local repeatability across bins:
 
@@ -624,7 +650,7 @@ The $t = 3\ \text{s}$ window is chosen because the GripVT sensor is intended for
 
 ##### I.4.2 Relative Drift ($\delta_{\text{drift}}$)
 
-Even with windowing, $\mu_0$ and $\mu_3$ are both absolute displacements that include the large static deformation offset from pressing to $z_{\text{thresh}}$. What is diagnostically meaningful is how much the displacement *changes* from the start of the hold to $t = 3\ \text{s}$:
+Even with windowing, $\mu_0$ and $\mu_3$ are both absolute displacements that include the large static deformation offset from pressing to $z_{\text{target}}$. What is diagnostically meaningful is how much the displacement *changes* from the start of the hold to $t = 3\ \text{s}$:
 
 $$\delta_{\text{drift}} = |\mu_3 - \mu_0|$$
 
@@ -699,10 +725,13 @@ ASCII Flow: Full Stage 1 Characterization Pipeline
     │                    │   │  Move XY ──────────►│
     │                    │   │  Drift gate check    │
     │                    │   │  Descend Z (0.1mm/step)►│
+    │                    │   │  Early-stop gate     │
     │                    │   │  Sample HX711 ◄──────│
     │                    │   │  z_thresh = 0.9×z_max│
+    │                    │   │  Update running_min  │
     │                    │   │  Write checkpoint    │
     │                    │   └─ end loop            │
+    │                    │   z_target = min(z_thresh)│
     │                    │   Save z_thresh_map JSON │
     │                    │                         │
     │─── Run Sensitivity ►── [Background thread]   │
@@ -710,9 +739,10 @@ ASCII Flow: Full Stage 1 Characterization Pipeline
     │                    │   │  Move XY ──────────►│
     │                    │   │  Drift gate check    │
     │                    │   │  ┌─ For each rep (×10):│
-    │                    │   │  │  Press Z_thresh ──►│
+    │                    │   │  │  Press Z_target ──►│
+    │                    │   │  │  (same depth, all bins)│
     │                    │   │  │  Settle 0.5s       │
-    │                    │   │  │  Record 30 frames ◄──camera│
+    │                    │   │  │  Record 10 frames ◄──camera│
     │                    │   │  │  Sample HX711 ◄────│
     │                    │   │  │  Retract ──────────►│
     │                    │   │  │  Write CSV rows     │
@@ -726,7 +756,7 @@ ASCII Flow: Full Stage 1 Characterization Pipeline
     │    Stability ──────►── [Stability dialog]    │
     │    Test            │   (shares Kalman states,│
     │                    │    serial ports, camera) │
-    │                    │   Press Z_thresh ───────►│
+    │                    │   Press Z_target ───────►│
     │                    │   Settle 2s (60 fr, discard)│
     │                    │   ┌─ Hold 30s (900 fr):  │
     │                    │   │  Record frame ◄───────camera│
@@ -761,11 +791,13 @@ The synthesized value for each metric column $m$ is:
 
 $$\hat{m}_{b^*} = \sum_{b \in \mathcal{N}_{b^*}} w_b \cdot m_b$$
 
-**Interpolated columns:** `z_thresh_mm`, `f_thresh_n`, `d_bar_mean_mm`, `d_bar_std_mm`, `f_actual_mean_n`, `rep_std_mm`, `d_bar_local_mean_mm`, `d_bar_local_std_mm`, `rep_std_local_mm`.
+**Interpolated columns:** `z_target_mm`, `f_thresh_n`, `d_bar_mean_mm`, `d_bar_std_mm`, `f_actual_mean_n`, `d_bar_local_mean_mm`, `d_bar_local_std_mm`, `rep_std_local_mm`.
 
-**Derived columns** (recomputed from interpolated values for internal consistency):
+**Derived column** (recomputed from interpolated values for internal consistency):
 
-$$S_{\text{scalar},b^*} = \frac{\hat{d}_{b^*}}{\hat{f}_{\text{thresh},b^*}}, \qquad S_{\text{local},b^*} = \frac{\hat{d}_{b^*}^{(k)}}{\hat{f}_{\text{thresh},b^*}}$$
+$$S_{\text{local},b^*} = \frac{\hat{z}_{\text{target},b^*}}{\hat{f}_{\text{actual},b^*}}$$
+
+Note that $z_{\text{target}}$ is nominally constant across all bins in a session (§G.1); interpolating it here accounts for the edge case where the target bin's calibration produced an anomalous value that differs from neighbours.
 
 **Identity columns** (`bin_id`, `bin_x_mm`, `bin_y_mm`, `n_markers`, `n_reps`, `n_markers_local`) are kept from the original row.
 
@@ -780,9 +812,13 @@ Default $k = 4$; at the bin pitch of $\approx 5.0$–$5.4$ mm the four nearest b
 *Notes for thesis/paper writing:*
 - *All default parameter values cited above (σ, k_size, τ, gate, Q, R, z_step, N_rep, _SETTLE_FRAMES, _HOLD_FRAMES, etc.) are those in the software at the time of writing and should be reported in a parameters table in the paper.*
 - *The 90% threshold rule (z_thresh = 0.90·z_max, f_thresh = 0.90·f_max) is an engineering safety margin, not derived from a material model — justify it in the paper as a conservative operating point.*
+- *The fixed-depth protocol (§G.1) is a deliberate design choice to decouple sensitivity from per-bin calibration depth variation. Justify it in the paper: because z_target is constant, S_local variation across bins reflects only force variation, making inter-bin and inter-blend comparisons interpretable.*
+- *S_local = z_target / f_actual_mean is a compliance metric (inverse stiffness). Cross-blend S_local values are indicative of relative compliance ranking; absolute values are depth-dependent and should be interpreted as such (see conservative reporting guidance in session notes).*
 - *The k=4 choice for local sensitivity should be sensitivity-tested (varying k=2,4,6,8) and reported as a hyperparameter.*
 - *The Poisson's ratio ν=0.495 is a literature approximation for silicone elastomers — cite appropriately and note it may differ per blend.*
 - *The area-to-z conversion assumes a simplified column-compression model; note this as an approximation and discuss its limits at large deformations.*
 - *The 10% stability gate threshold is an engineering design choice — justify it in the paper in relation to the GripVT's intended operating condition (3-second grasp holds) and the effective noise floor after windowing (~0.012 mm vs gate ~0.07 mm).*
 - *The t=3s window placement (frames 75–104) is motivated by the GripVT operational protocol; if the hold duration changes, the window placement should be revisited.*
 - *drift_rate_mm_per_s is a supplementary metric — clarify in the paper that it is not used for binary gating but for continuous blend ranking in the scoring matrix.*
+- *S_scalar_mm_per_n and rep_std_mm columns no longer exist in the summary CSV. Do not reference them in the thesis.*
+
