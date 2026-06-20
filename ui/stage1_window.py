@@ -38,7 +38,7 @@ from output.stage1_writer import (
 )
 import io
 from output.checkpoint import CheckpointManagerV4, CheckpointManagerHysteresis
-from output.stability_writer import StabilityWriter, write_stability_summary_partial
+from output.stability_writer import StabilityWriter, write_stability_summary
 from output.hysteresis_writer import HysteresisWriter, write_hysteresis_summary
 
 
@@ -2805,7 +2805,7 @@ class SensitivityWindow(ctk.CTk):
                     self._st_drift_rate_mm_per_s = float(coeffs[0])
 
         if self._st_writer is not None and not aborted:
-            write_stability_summary_partial(
+            write_stability_summary(
                 session_dir=self._st_session_dir,
                 blend=self._st_blend_id,
                 session_ts=self._st_writer.ts,
