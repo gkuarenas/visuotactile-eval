@@ -174,7 +174,7 @@ For each hold frame $f$, the mean absolute depth displacement over all non-autof
 
 $$\overline{|\Delta z|}_f = \frac{1}{|\mathcal{M}_f^*|} \sum_{i\,\in\,\mathcal{M}_f^*} |\Delta z_{f,i}|$$
 
-where $\mathcal{M}_f^*$ is the set of non-autofilled markers in frame $f$. The scalar time series $\{\overline{|\Delta z|}_f\}_{f=0}^{N-1}$ is the input to all stability metrics.
+where $\mathcal{M}_f^*$ is the set of non-autofilled markers in frame $f$. The scalar time series $\{\overline{|\Delta z|}_f\}_{f=0}^{N-1}$ is the input to all stability metrics. The quantity $\bar{d}_b$ computed from the sensitivity session is retained in the sensitivity summary CSV (`d_bar_mean_mm`) as a diagnostic for the spatial extent of the deformation field.
 
 ### I.2 Windowed Drift Means
 
@@ -192,11 +192,11 @@ where $N_3 = \min(30,\ N - 75)$ to accommodate partial holds. The $t = 3$ s wind
 
 ### I.3 Relative Drift
 
-The primary stability metric is the absolute change in windowed displacement between the onset and the 3-second mark of the hold:
+The primary stability scoring metric is the absolute change in windowed displacement between the onset and the 3-second mark of the hold:
 
 $$\delta_{\text{drift}} = |\mu_3 - \mu_0|$$
 
-The absolute value captures both creep ($\mu_3 > \mu_0$, markers continue to compress) and viscoelastic relaxation ($\mu_3 < \mu_0$, markers recover) as forms of instability under sustained load.
+The absolute value captures both creep ($\mu_3 > \mu_0$, markers continue to compress) and viscoelastic relaxation ($\mu_3 < \mu_0$, markers recover) as forms of instability under sustained load. $\delta_{\text{drift}}$ is the `delta_drift_mm` field in the summary JSON and is the primary scoring matrix input for the stability dimension.
 
 ### I.4 Drift Rate
 
@@ -204,20 +204,14 @@ A supplementary continuous metric is obtained by fitting a linear trend to the f
 
 $$\overline{|\Delta z|}_f \approx m \cdot t_f + b, \qquad t_f = f\ /\ f_{\text{FPS}}$$
 
-where $f_{\text{FPS}} = 30$ fps. The slope $m$ is the drift rate $\dot{\delta}$ [mm s$^{-1}$], computed by ordinary least squares over all valid frames, provided $N \geq 60$. A positive slope indicates ongoing creep; a negative slope indicates relaxation; a slope near zero indicates a settled, stable response. Unlike $\delta_{\text{drift}}$, which is bounded to the 0–3 s window, the drift rate uses all 900 frames and provides a more statistically robust estimate of the long-run displacement trend. It is used for continuous blend ranking, not binary gating.
+where $f_{\text{FPS}} = 30$ fps. The slope $m$ is the drift rate $\dot{\delta}$ [mm s$^{-1}$], computed by ordinary least squares over all valid frames, provided $N \geq 60$. A positive slope indicates ongoing creep; a negative slope indicates relaxation; a slope near zero indicates a settled, stable response. Unlike $\delta_{\text{drift}}$, which is bounded to the 0–3 s window, the drift rate uses all 900 frames and provides a more statistically robust estimate of the long-run displacement trend. It is used for continuous per-blend ranking and is stored as the supplementary `drift_rate_mm_per_s` field in the summary JSON.
 
-### I.5 Normalized Stability Gate
+### I.5 Scoring Matrix Entry
 
-To compare $\delta_{\text{drift}}$ across blends of different absolute sensitivity levels, it is normalized by the blend's mean steady-state displacement at $z_{\text{target}}$:
+$\delta_{\text{drift}}$ enters the weighted scoring matrix directly as the stability dimension input. For a blend with $n$ slab replicates, the blend-level entry is:
 
-$$S_{\text{at}\,z} = \frac{1}{|\mathcal{B}|} \sum_{b\,\in\,\mathcal{B}} \bar{d}_b$$
+$$\overline{\delta}_{\text{drift}} = \frac{1}{n} \sum_{s=1}^{n} \delta_{\text{drift},s}$$
 
-where $\bar{d}_b = (N_{\text{rep}} \cdot N_{\text{frames}} \cdot |\mathcal{M}|)^{-1} \sum_{r,f,i} |\Delta z_{b,r,f,i}|$ is the all-marker per-bin mean depth displacement from the sensitivity session. The quantity $S_{\text{at}\,z}$ represents the typical sensor-wide marker displacement at full press depth for the blend under test. The normalized drift percentage is:
+where each $\delta_{\text{drift},s}$ is computed from that slab's own $\mu_{0,s}$ and $\mu_{3,s}$ (i.e., each replicate's drift relative to its own hold-onset baseline). Lower $\overline{\delta}_{\text{drift}}$ indicates a more stable blend.
 
-$$\text{drift\_pct} = \frac{\delta_{\text{drift}}}{S_{\text{at}\,z}} \times 100\ [\%]$$
-
-A blend passes the stability gate when:
-
-$$\text{drift\_pct} \leq 10\ \%$$
-
-This threshold requires that the displacement change over the 3-second assessment window remain below one-tenth of the blend's steady-state deformation magnitude. With the effective post-windowing noise floor of $\approx 0.012$ mm and typical steady-state values of $\approx 0.7$–$0.8$ mm, the gate threshold corresponds to a signal-to-noise ratio of approximately 6:1, ensuring the gate responds to material drift rather than measurement noise.
+No normalization by a sensitivity reference is applied. Blend stiffness is independently characterized by Shore 00 hardness and ASTM D412C tensile testing; normalizing $\delta_{\text{drift}}$ by the steady-state displacement magnitude $S_{\text{at}\,z}$ would re-introduce a stiffness dependence and double-count stiffness in the scoring matrix. The scoring matrix handles cross-blend normalization internally.

@@ -559,7 +559,7 @@ where $\mathcal{M}_f^*$ is the set of non-autofilled markers in frame $f$ and $\
 
 The LoG detector (§B.2–B.4) introduces frame-to-frame centroid jitter of approximately 2–3 px even when the sensor is physically stationary. Although this jitter is a positional noise on $(c_x, c_y)$, it propagates into $\Delta z$ through the area-to-z conversion (§D.2): a small centroid shift changes how the connected-component boundary is traced, altering the reported pixel count $A$. The net effect is a noise floor on $|\Delta z_{f,i}|$ of approximately 0.05–0.08 mm per frame. This jitter is spatially uncorrelated across markers and is approximately constant in magnitude regardless of whether the sensor is loaded or unloaded.
 
-The gate threshold for the stability test is nominally 10% of the mean steady-state displacement at $z_{\text{thresh}}$. For the blends tested, $S_{\text{at }z} \approx 0.7$–$0.8\ \text{mm}$, giving gate values of $\approx 0.07$–$0.08\ \text{mm}$. Since the per-frame noise floor is of the same order as the gate value, **a single-frame read at $t = 3\ \text{s}$ is unreliable** for per-blend discrimination. Two complementary noise-suppression strategies are applied to the `hold_means` sequence and are described under §I.4.
+The effective post-windowing noise floor is $\approx 0.012$ mm. For the blends tested, steady-state displacement values are $\approx 0.7$–$0.8\ \text{mm}$, making **a single-frame read at $t = 3\ \text{s}$ unreliable** for per-blend discrimination. Two complementary noise-suppression strategies are applied to the `hold_means` sequence and are described under §I.4.
 
 #### H.5 Output Data
 
@@ -568,7 +568,7 @@ Each stability test session produces the following files in `output/sessions/<bl
 | File | Contents |
 |------|----------|
 | `stability_data_<ts>.csv` | Per-frame, per-marker rows: `frame_index, t_s, marker_id, delta_z_mm, abs_delta_z_mm, mean_abs_delta_z_mm` |
-| `stability_summary_<blend_id>.json` | Session metadata and aggregated metrics; gate fields left null for offline notebook computation (§I.4.4) |
+| `stability_summary_<blend_id>.json` | Session metadata and aggregated stability metrics: `drift_0s_mm`, `drift_3s_mm`, `delta_drift_mm`, `drift_rate_mm_per_s` |
 
 The summary JSON is written atomically (`tmp → os.replace`) at session end. A partial hold (E-Stop before 900 frames) still produces a valid summary provided sufficient frames were collected for windowed metric computation (§I.4.1).
 
@@ -582,7 +582,7 @@ For bin $b$, the all-marker displacement response is the mean z-displacement mag
 
 $$\bar{d}_{b} = \frac{1}{N_{\text{rep}} \cdot N_{\text{frames}} \cdot N_{\text{markers}}} \sum_{r=1}^{N_{\text{rep}}} \sum_{f=1}^{N_{\text{frames}}} \sum_{i \in \mathcal{M}} |\Delta z_{b,r,f,i}|$$
 
-This quantity $\bar{d}_b$ is retained in the summary CSV (`d_bar_mean_mm`) as a diagnostic for the spatial extent of the deformation field, and is used in the normalised stability gate (§I.4.4). It is not directly used as a sensitivity metric; the primary sensitivity index is the local compliance $S_{\text{local}}$ described in §I.2.
+This quantity $\bar{d}_b$ is retained in the summary CSV (`d_bar_mean_mm`) as a diagnostic for the spatial extent of the deformation field. It is not directly used as a sensitivity metric; the primary sensitivity index is the local compliance $S_{\text{local}}$ described in §I.2.
 
 #### I.2 Per-Bin Local Sensitivity ($k$-Nearest Markers)
 
@@ -630,7 +630,7 @@ These four metrics — $S_{\text{global}},\ \sigma_{\text{global}},\ U,\ \text{R
 
 #### I.4 Sustained-Load Stability Metrics
 
-The following metrics are computed from the `hold_means` sequence $\{\overline{|\Delta z|}_f\}_{f=0}^{N-1}$ produced during Phase 3 (§H). Metrics I.4.1–I.4.3 are computed by the GUI at session end and stored in the summary JSON. The gate metric (§I.4.4) requires the sensitivity session's $\bar{d}_b$ values and is therefore computed offline in the analysis notebook.
+The following metrics are computed from the `hold_means` sequence $\{\overline{|\Delta z|}_f\}_{f=0}^{N-1}$ produced during Phase 3 (§H). All metrics are computed by the GUI at session end and stored in the summary JSON.
 
 ##### I.4.1 Windowed Drift Means
 
@@ -663,7 +663,7 @@ Taking the absolute value captures both creep ($\mu_3 > \mu_0$, markers continue
 | Viscoelastic relaxation | 0.74 mm | 0.67 mm | 0.07 mm |
 | Pure jitter (no material trend) | 0.74 mm | 0.74 mm | ~0.01 mm (residual after windowing) |
 
-This is the `delta_drift_mm` field in the summary JSON and is the primary gate input.
+This is the `delta_drift_mm` field in the summary JSON and is the primary scoring matrix input for the stability dimension.
 
 ##### I.4.3 Drift Rate (Linear Slope)
 
@@ -675,25 +675,17 @@ where $f_{\text{PS}} = 30\ \text{fps}$. The slope $m$ is the drift rate:
 
 $$\dot{\delta} = m \quad [\text{mm/s}]$$
 
-computed via `numpy.polyfit` over all valid (non-NaN) frames, provided at least $N \geq 60$ frames are available. A positive slope indicates ongoing creep; a negative slope indicates relaxation; a slope near zero indicates a settled, stable response. Unlike $\delta_{\text{drift}}$ (which captures only the 0–3 s window), the drift rate uses all 900 frames and therefore provides a more statistically robust estimate of the long-run trend. It is stored as `drift_rate_mm_per_s` in the summary JSON and is used for continuous per-blend ranking in the scoring matrix, not for binary gating.
+computed via `numpy.polyfit` over all valid (non-NaN) frames, provided at least $N \geq 60$ frames are available. A positive slope indicates ongoing creep; a negative slope indicates relaxation; a slope near zero indicates a settled, stable response. Unlike $\delta_{\text{drift}}$ (which captures only the 0–3 s window), the drift rate uses all 900 frames and therefore provides a more statistically robust estimate of the long-run trend. It is stored as `drift_rate_mm_per_s` in the summary JSON and is used for continuous per-blend ranking.
 
-##### I.4.4 Normalised Stability Gate
+##### I.4.4 Scoring Matrix Entry
 
-The gate metric normalises $\delta_{\text{drift}}$ by the blend's mean steady-state displacement at $z_{\text{thresh}}$, making the threshold meaningful regardless of a blend's absolute sensitivity level:
+$\delta_{\text{drift}}$ enters the weighted scoring matrix directly as the stability dimension input. For a blend with $n$ slab replicates, the blend-level entry is:
 
-$$S_{\text{at }z} = \frac{1}{|\mathcal{B}|} \sum_{b \in \mathcal{B}} \bar{d}_b$$
+$$\overline{\delta}_{\text{drift}} = \frac{1}{n} \sum_{s=1}^{n} \delta_{\text{drift},s}$$
 
-where $\bar{d}_b$ is the per-bin mean absolute z-displacement from the sensitivity session (§I.1) and $\mathcal{B}$ is the set of non-skipped bins. $S_{\text{at }z}$ represents the typical sensor-wide marker displacement at full press depth for the blend under test. It is computed offline in the analysis notebook (`stage1_results.ipynb`, §9a) using the sensitivity session data already loaded for the blend, and written back into the summary JSON as `S_at_z_thresh_mm`.
+where each $\delta_{\text{drift},s}$ is computed from that slab's own $\mu_{0,s}$ and $\mu_{3,s}$. Lower $\overline{\delta}_{\text{drift}}$ indicates a more stable blend.
 
-The normalised drift percentage is:
-
-$$\text{drift\_pct} = \frac{\delta_{\text{drift}}}{S_{\text{at }z}} \times 100\ [\%]$$
-
-The binary gate verdict:
-
-$$\text{gate\_pass} = \begin{cases} \text{True} & \text{if } \text{drift\_pct} \leq 10\ \% \\ \text{False} & \text{otherwise} \end{cases}$$
-
-A 10% threshold means a blend whose displacement changes by more than one-tenth of its steady-state deformation magnitude over 3 seconds is considered insufficiently stable. Blends failing this gate may be excluded from the weighted scoring matrix in subsequent blend-ranking stages. The three gate fields (`S_at_z_thresh_mm`, `drift_pct`, `gate_pass`) are left null in the GUI-written JSON and are populated offline.
+No normalization by a sensitivity reference is applied. Blend stiffness is independently characterized by Shore 00 hardness and ASTM D412C tensile testing; normalizing $\delta_{\text{drift}}$ by the steady-state displacement magnitude would re-introduce stiffness dependence and double-count stiffness in the scoring matrix. The scoring matrix handles cross-blend normalization internally.
 
 ---
 
@@ -817,8 +809,8 @@ Default $k = 4$; at the bin pitch of $\approx 5.0$–$5.4$ mm the four nearest b
 - *The k=4 choice for local sensitivity should be sensitivity-tested (varying k=2,4,6,8) and reported as a hyperparameter.*
 - *The Poisson's ratio ν=0.495 is a literature approximation for silicone elastomers — cite appropriately and note it may differ per blend.*
 - *The area-to-z conversion assumes a simplified column-compression model; note this as an approximation and discuss its limits at large deformations.*
-- *The 10% stability gate threshold is an engineering design choice — justify it in the paper in relation to the GripVT's intended operating condition (3-second grasp holds) and the effective noise floor after windowing (~0.012 mm vs gate ~0.07 mm).*
+- *delta_drift_mm (§I.4.2) is the stability scoring matrix input. The effective post-windowing noise floor (~0.012 mm) should be reported alongside blend-level delta_drift_mm values to contextualize their magnitude.*
 - *The t=3s window placement (frames 75–104) is motivated by the GripVT operational protocol; if the hold duration changes, the window placement should be revisited.*
-- *drift_rate_mm_per_s is a supplementary metric — clarify in the paper that it is not used for binary gating but for continuous blend ranking in the scoring matrix.*
+- *drift_rate_mm_per_s is a supplementary metric used for continuous blend ranking.*
 - *S_scalar_mm_per_n and rep_std_mm columns no longer exist in the summary CSV. Do not reference them in the thesis.*
 
