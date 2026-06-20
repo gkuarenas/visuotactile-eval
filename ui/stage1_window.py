@@ -305,6 +305,7 @@ class SensitivityWindow(ctk.CTk):
         self._st_stop_ev = threading.Event()
         self._st_worker: Optional[threading.Thread] = None
         self._st_blend_id = ""
+        self._st_sample_n = 1
         self._st_session_dir = ""
         self._st_z_thresh_mm = 0.0
         self._st_writer: Optional[StabilityWriter] = None
@@ -803,23 +804,28 @@ class SensitivityWindow(ctk.CTk):
 
         setup = ctk.CTkFrame(f, fg_color="transparent")
         setup.pack(fill="x", padx=4, pady=2)
-        ctk.CTkLabel(setup, text="Blend ID:").grid(row=0, column=0, padx=(4, 2), pady=2, sticky="e")
+        ctk.CTkLabel(setup, text="Blend:").grid(row=0, column=0, padx=(4, 2), pady=2, sticky="e")
         self._st_blend_var = ctk.StringVar(value="")
         ctk.CTkEntry(setup, textvariable=self._st_blend_var, width=100).grid(
             row=0, column=1, padx=(0, 4), pady=2, sticky="w"
         )
-        ctk.CTkLabel(setup, text="Session folder:").grid(row=1, column=0, padx=(4, 2), pady=2, sticky="e")
-        self._st_folder_var = ctk.StringVar(value="")
-        ctk.CTkEntry(setup, textvariable=self._st_folder_var, width=180).grid(
+        ctk.CTkLabel(setup, text="Sample #:").grid(row=1, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._st_sample_var = ctk.StringVar(value="1")
+        ctk.CTkEntry(setup, textvariable=self._st_sample_var, width=60).grid(
             row=1, column=1, padx=(0, 4), pady=2, sticky="w"
         )
+        ctk.CTkLabel(setup, text="Session folder:").grid(row=2, column=0, padx=(4, 2), pady=2, sticky="e")
+        self._st_folder_var = ctk.StringVar(value="")
+        ctk.CTkEntry(setup, textvariable=self._st_folder_var, width=180).grid(
+            row=2, column=1, padx=(0, 4), pady=2, sticky="w"
+        )
         ctk.CTkButton(setup, text="Browse", width=60, command=self._st_on_browse).grid(
-            row=1, column=2, padx=(0, 4), pady=2
+            row=2, column=2, padx=(0, 4), pady=2
         )
         self._st_z_thresh_info_var = ctk.StringVar(value="z_thresh: —")
         ctk.CTkLabel(setup, textvariable=self._st_z_thresh_info_var,
                      font=ctk.CTkFont(family="Courier", size=10), anchor="w").grid(
-            row=2, column=0, columnspan=3, padx=4, pady=(0, 4), sticky="w"
+            row=3, column=0, columnspan=3, padx=4, pady=(0, 4), sticky="w"
         )
 
         btn_row = ctk.CTkFrame(f, fg_color="transparent")
@@ -2647,8 +2653,10 @@ class SensitivityWindow(ctk.CTk):
                                  "Capture Baseline before running the stability test.")
             return
         self._st_blend_id = blend_id
+        self._st_sample_n = max(1, int(self._st_sample_var.get() or 1))
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = os.path.join("output", "sessions", f"{ts}_{blend_id}_stability")
+        out_dir = os.path.join("output", "sessions", blend_id,
+                               f"{ts}_n{self._st_sample_n}_stability")
         self._st_session_dir = out_dir
         self._st_writer = StabilityWriter(out_dir)
         self._st_hold_means = []
@@ -2875,8 +2883,6 @@ class SensitivityWindow(ctk.CTk):
         self._st_plot_photo = None
         self._st_progress_var.set("")
         self._st_drift_var.set("")
-        self._st_blend_var.set("")
-        self._st_folder_var.set("")
         self._st_z_thresh_info_var.set("z_thresh: —")
         self._st_writer = None
         self._st_stop_ev.clear()
