@@ -37,7 +37,7 @@ from output.stage1_writer import (
     write_idle_noise_csv, replace_bin_rows_in_csv,
 )
 import io
-from output.checkpoint import CheckpointManagerV4, CheckpointManagerHysteresis
+from output.checkpoint import CheckpointManagerV4
 from output.stability_writer import StabilityWriter, write_stability_summary
 from output.hysteresis_writer import HysteresisWriter, write_hysteresis_summary
 
@@ -134,10 +134,11 @@ _ST_PLOT_W_PX        = 400
 _ST_PLOT_H_PX        = 160
 
 # ── Hysteresis panel constants ────────────────────────────────────────────────
+_HY_MAX_DEPTH_MM      = 3.5    # default indentation depth for hysteresis ramp
+_HY_SPEEDS_MM_S       = [0.1, 0.5, 1.0, 2.0, 3.5]   # indenter speeds tested
 _HY_RAMP_STEP_MM      = 0.1    # depth increment per ramp step
 _HY_FRAMES_PER_STEP   = 3      # frames recorded at each depth level (30 fps ≈ 100 ms)
-_HY_STEP_SETTLE_S     = 0.10   # wait after each G1 move before recording
-_HY_RAMP_FEEDRATE     = 150    # mm/min — ramp inside elastomer (matches _COLLECT_PRESS_FEEDRATE)
+_HY_STEP_SETTLE_S     = 0.05   # mechanical settle after each G1 move — no viscoelastic wait
 _HY_APPROACH_FEEDRATE = 3000   # mm/min — fast travel to/from Z=0 (no recording)
 
 
@@ -322,13 +323,11 @@ class SensitivityWindow(ctk.CTk):
         self._hy_stop_ev   = threading.Event()
         self._hy_worker: Optional[threading.Thread] = None
         self._hy_blend_id  = ""
-        self._hy_calib_folder = ""
         self._hy_session_dir = ""
         self._hy_session_ts  = ""
-        self._hy_z_thresh_map: dict[int, dict] = {}
-        self._hy_z_retract_mm = 5.0
+        self._hy_z_retract_mm  = 5.0
+        self._hy_max_depth_mm  = _HY_MAX_DEPTH_MM
         self._hy_writer: Optional[HysteresisWriter] = None
-        self._hy_checkpoint = CheckpointManagerHysteresis()
         self._hy_bins_completed: list[int] = []
         self._hy_bins_skipped:   list[int] = []
         self._hy_per_bin_status: dict[str, dict[str, object]] = {}
@@ -873,39 +872,44 @@ class SensitivityWindow(ctk.CTk):
 
         setup = ctk.CTkFrame(f, fg_color="transparent")
         setup.pack(fill="x", padx=4, pady=2)
-        ctk.CTkLabel(setup, text="Blend ID:").grid(row=0, column=0, padx=(4, 2), pady=2, sticky="e")
+        setup.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(setup, text="Blend ID:", anchor="e").grid(
+            row=0, column=0, padx=(4, 2), pady=2, sticky="e"
+        )
         self._hy_blend_var = ctk.StringVar(value="")
         ctk.CTkEntry(setup, textvariable=self._hy_blend_var, width=110).grid(
             row=0, column=1, padx=(0, 4), pady=2, sticky="w"
         )
-        ctk.CTkLabel(setup, text="Sample #:").grid(row=1, column=0, padx=(4, 2), pady=2, sticky="e")
+        ctk.CTkLabel(setup, text="Sample #:", anchor="e").grid(
+            row=1, column=0, padx=(4, 2), pady=2, sticky="e"
+        )
         self._hy_sample_var = ctk.StringVar(value="1")
         ctk.CTkEntry(setup, textvariable=self._hy_sample_var, width=50).grid(
             row=1, column=1, padx=(0, 4), pady=2, sticky="w"
         )
-        ctk.CTkLabel(setup, text="Z Retract (mm):").grid(row=2, column=0, padx=(4, 2), pady=2, sticky="e")
+        ctk.CTkLabel(setup, text="Z Retract (mm):", anchor="e").grid(
+            row=2, column=0, padx=(4, 2), pady=2, sticky="e"
+        )
         self._hy_z_retract_var = ctk.StringVar(value="5.0")
         ctk.CTkEntry(setup, textvariable=self._hy_z_retract_var, width=70).grid(
             row=2, column=1, padx=(0, 4), pady=2, sticky="w"
         )
-        ctk.CTkLabel(setup, text="Calib folder:").grid(row=3, column=0, padx=(4, 2), pady=2, sticky="e")
-        calib_row = ctk.CTkFrame(setup, fg_color="transparent")
-        calib_row.grid(row=3, column=1, padx=(0, 4), pady=2, sticky="w")
-        self._hy_folder_var = ctk.StringVar(value="")
-        ctk.CTkEntry(calib_row, textvariable=self._hy_folder_var, width=160).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(calib_row, text="Browse…", width=70,
-                      command=self._hy_on_browse).pack(side="left")
-        self._hy_session_info_var = ctk.StringVar(value="Session: —")
-        ctk.CTkLabel(setup, textvariable=self._hy_session_info_var,
-                     font=ctk.CTkFont(family="Courier", size=10), anchor="w",
-                     wraplength=_RIGHT_W - 40).grid(
-            row=4, column=0, columnspan=2, padx=4, pady=(0, 2), sticky="w"
+        ctk.CTkLabel(setup, text="Max Depth (mm):", anchor="e").grid(
+            row=3, column=0, padx=(4, 2), pady=2, sticky="e"
         )
-        self._hy_map_info_var = ctk.StringVar(value="z_thresh_map: 0/35 bins")
-        ctk.CTkLabel(setup, textvariable=self._hy_map_info_var,
-                     font=ctk.CTkFont(family="Courier", size=10), anchor="w").grid(
-            row=5, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w"
+        self._hy_max_depth_var = ctk.StringVar(value=str(_HY_MAX_DEPTH_MM))
+        ctk.CTkEntry(setup, textvariable=self._hy_max_depth_var, width=70).grid(
+            row=3, column=1, padx=(0, 4), pady=2, sticky="w"
         )
+        speeds_str = "  ".join(str(s) for s in _HY_SPEEDS_MM_S)
+        ctk.CTkLabel(
+            setup,
+            text=f"Speeds (mm/s): {speeds_str}",
+            font=ctk.CTkFont(family="Courier", size=10),
+            anchor="w",
+            wraplength=_RIGHT_W - 20,
+        ).grid(row=4, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w")
 
         btn_row = ctk.CTkFrame(f, fg_color="transparent")
         btn_row.pack(fill="x", padx=8, pady=(0, 4))
@@ -926,7 +930,8 @@ class SensitivityWindow(ctk.CTk):
 
         self._hy_progress_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._hy_progress_var,
-                     font=ctk.CTkFont(family="Courier", size=10), anchor="w").pack(
+                     font=ctk.CTkFont(family="Courier", size=10), anchor="w",
+                     wraplength=_RIGHT_W - 20).pack(
             fill="x", padx=8, pady=(2, 0)
         )
         self._hy_progress_bar = ctk.CTkProgressBar(f, width=_RIGHT_W - 40)
@@ -936,6 +941,7 @@ class SensitivityWindow(ctk.CTk):
         self._hy_done_lbl = ctk.CTkLabel(
             f, textvariable=self._hy_done_var,
             font=ctk.CTkFont(family="Courier", size=11), anchor="w", justify="left",
+            wraplength=_RIGHT_W - 20,
         )
         return f
 
@@ -1286,7 +1292,6 @@ class SensitivityWindow(ctk.CTk):
             self._diag_frame = diag
             self._diag_frame_until = time.time() + 3.0
 
-        self._hy_map_info_var.set(f"z_thresh_map: {len(self._v4_z_thresh_map)}/35 bins")
         self._hy_session_info_var.set(f"Session: {self._session_dir or '—'}")
         self._set_state(HUB)
 
@@ -2923,40 +2928,6 @@ class SensitivityWindow(ctk.CTk):
     def _hy_post(self, key: str, value: object) -> None:
         self._hy_msg_q.put((key, value))
 
-    def _hy_on_browse(self) -> None:
-        folder = filedialog.askdirectory(
-            title="Select session folder containing z_thresh_map.json"
-        )
-        if folder:
-            self._hy_folder_var.set(folder)
-            self._hy_calib_folder = folder
-            self._hy_try_load_z_thresh_map(folder)
-
-    def _hy_try_load_z_thresh_map(self, folder: str) -> bool:
-        if not folder or not os.path.isdir(folder):
-            self._hy_map_info_var.set("z_thresh_map: 0/35 bins")
-            return False
-        candidates: list[str] = [
-            os.path.join(folder, name)
-            for name in os.listdir(folder)
-            if name.startswith("z_thresh_map") and name.endswith(".json")
-        ]
-        if not candidates:
-            self._hy_map_info_var.set("z_thresh_map: 0/35 bins  (not found)")
-            return False
-        for path in sorted(candidates):
-            data = load_z_thresh_map(path)
-            if data is None:
-                continue
-            bins: dict[int, dict] = data["bins"]
-            if not bins:
-                continue
-            self._v4_z_thresh_map = bins
-            self._hy_map_info_var.set(f"z_thresh_map: {len(bins)}/35 bins  (loaded from folder)")
-            return True
-        self._hy_map_info_var.set("z_thresh_map: 0/35 bins  (parse error)")
-        return False
-
     def _hy_on_start(self) -> None:
         blend_id = self._hy_blend_var.get().strip()
         if not blend_id:
@@ -2976,49 +2947,27 @@ class SensitivityWindow(ctk.CTk):
         except ValueError:
             messagebox.showerror("Input Error", "Z Retract must be a positive number.")
             return
+        try:
+            max_depth = float(self._hy_max_depth_var.get())
+            if max_depth <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Input Error", "Max Depth must be a positive number.")
+            return
         if not self._tracker.baseline_set:
             messagebox.showerror("No Baseline",
                                  "Capture Baseline before running the hysteresis test.")
             return
-        if len(self._v4_z_thresh_map) < 35:
-            messagebox.showerror("Incomplete Calibration",
-                f"z_thresh_map has {len(self._v4_z_thresh_map)}/35 bins.\n"
-                "Run or load a complete v4 calibration first.")
+        if not self._ender_connected:
+            messagebox.showerror("No Ender", "Ender not connected.")
             return
-
-        cp = self._hy_checkpoint.scan_for_resume()
-        if cp is not None and cp.get("blend_id") == blend_id:
-            resume = messagebox.askyesno(
-                "Resume Session",
-                f"Incomplete hysteresis session found:\n"
-                f"  Timestamp: {cp.get('session_ts', '?')}\n"
-                f"  Bins complete: {len(cp.get('completed_bin_ids', []))}/35\n\n"
-                f"Resume this session?"
-            )
-            if resume:
-                self._hy_session_dir    = str(cp["session_dir"])
-                self._hy_session_ts     = str(cp.get("session_ts", ""))
-                self._hy_bins_completed = list(cp.get("completed_bin_ids", []))
-                self._hy_bins_skipped   = list(cp.get("skipped_bin_ids", []))
-                resume_csv: str | None  = cp.get("csv_path") or None  # type: ignore[assignment]
-                self._hy_writer         = HysteresisWriter(self._hy_session_dir, csv_path=resume_csv)
-                self._hy_blend_id       = blend_id
-                self._hy_z_retract_mm   = z_retract
-                self._hy_z_thresh_map   = {int(k): v for k, v in self._v4_z_thresh_map.items()}
-                self._hy_per_bin_status = {}
-                self._hy_stop_ev.clear()
-                self._hy_state = HY_PANEL_SWEEPING
-                self._set_state(HY_PANEL_SWEEPING)
-                self._hy_worker = threading.Thread(target=self._hy_worker_fn, daemon=True)
-                self._hy_worker.start()
-                return
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._hy_blend_id       = blend_id
         self._hy_session_ts     = ts
         self._hy_session_dir    = f"output/sessions/{blend_id}/{ts}_n{sample_num}_hysteresis"
         self._hy_z_retract_mm   = z_retract
-        self._hy_z_thresh_map   = {int(k): v for k, v in self._v4_z_thresh_map.items()}
+        self._hy_max_depth_mm   = max_depth
         self._hy_bins_completed = []
         self._hy_bins_skipped   = []
         self._hy_per_bin_status = {}
@@ -3030,200 +2979,134 @@ class SensitivityWindow(ctk.CTk):
         self._hy_worker.start()
 
     def _hy_worker_fn(self) -> None:
-        n_baseline = len(self._tracker.baseline_positions_mm)
-        z_retract = self._hy_z_retract_mm
-
         center_bin = next(b for b in GRID_7X5 if b["bin_id"] == 18)
-        bins: list[dict] = [center_bin]
-        total = 1
+        x_mm      = center_bin["x_mm"]
+        y_mm      = center_bin["y_mm"]
+        z_retract = self._hy_z_retract_mm
+        max_depth = self._hy_max_depth_mm
+        n_steps   = max(1, round(max_depth / _HY_RAMP_STEP_MM))
+        n_speeds  = len(_HY_SPEEDS_MM_S)
 
         self._ender_sync_cmd("G90", timeout=10.0)
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
         self._ender_sync_cmd("M400", timeout=30.0)
+        self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000", timeout=30.0)
+        self._ender_sync_cmd("M400", timeout=30.0)
 
-        consec_failures = 0
+        sweep_aborted = False
 
-        for idx, b in enumerate(bins):
+        for speed_idx, speed_mm_s in enumerate(_HY_SPEEDS_MM_S):
             if self._hy_stop_ev.is_set():
-                break
-            bin_id  = b["bin_id"]
-            x_mm    = b["x_mm"]
-            y_mm    = b["y_mm"]
-            bin_lbl = f"B{bin_id:02d}"
-
-            if bin_id in self._hy_bins_completed:
-                self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  already complete")
-                self._hy_post("progress_frac", (idx + 1) / total)
-                continue
-
-            self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  moving XY")
-            self._hy_post("progress_frac", idx / total)
-
-            self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000", timeout=30.0)
-            self._ender_sync_cmd("M400", timeout=30.0)
-
-            if self._hy_stop_ev.is_set():
+                sweep_aborted = True
                 break
 
-            if not self._check_baseline_drift(bin_id):
-                self._hy_stop_ev.set()
-                self._hy_post("status", f"Aborted by operator at {bin_lbl} (drift gate).")
-                break
+            feedrate = speed_mm_s * 60.0  # mm/s → mm/min
 
-            entry = self._hy_z_thresh_map.get(bin_id)
-            if entry is None:
-                self._hy_per_bin_status[bin_lbl] = {"mid_loss": True, "HI_pct": None}
-                consec_failures += 1
-                self._hy_post("progress", f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  no calibration entry")
-                continue
+            self._hy_post("progress",
+                f"Speed {speed_idx + 1}/{n_speeds} ({speed_mm_s} mm/s) | approaching surface")
+            self._hy_post("progress_frac", speed_idx / n_speeds)
 
-            z_thresh_mm: float = float(entry["z_thresh_mm"])
-
-            # Fast travel to surface — no recording above Z=0
             self._ender_sync_cmd(f"G1 Z0.000 F{_HY_APPROACH_FEEDRATE}", timeout=15.0)
             self._ender_sync_cmd("M400", timeout=15.0)
             time.sleep(_HY_STEP_SETTLE_S)
 
-            # ── Loading ramp: Z=0 → z_thresh in 0.1 mm steps (contact zone only) ──
-            n_load = max(1, round(abs(z_thresh_mm) / _HY_RAMP_STEP_MM))
-            z_load: list[float] = [-_HY_RAMP_STEP_MM * i for i in range(n_load + 1)]
-            z_load[-1] = z_thresh_mm
-
-            all_load_steps: list[tuple[int, float, list[tuple[list[MarkerRecord], float]]]] = []
+            # ── Loading ramp: Z=0 → -max_depth ───────────────────────────────
+            LoadStep = tuple[int, float, list[tuple[list[MarkerRecord], float]], float]
+            load_steps: list[LoadStep] = []
             ramp_aborted = False
-            for step_i, z_pos in enumerate(z_load):
+            for step_i in range(n_steps + 1):
                 if self._hy_stop_ev.is_set():
                     ramp_aborted = True
                     break
+                z_pos = round(-_HY_RAMP_STEP_MM * step_i, 4)
+                if step_i == n_steps:
+                    z_pos = -max_depth
                 self._hy_post("progress",
-                    f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  "
-                    f"loading {step_i + 1}/{n_load} (z={z_pos:.2f} mm)")
-                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{_HY_RAMP_FEEDRATE}", timeout=15.0)
-                self._ender_sync_cmd("M400", timeout=15.0)
+                    f"Speed {speed_idx + 1}/{n_speeds} ({speed_mm_s} mm/s) | "
+                    f"loading {step_i + 1}/{n_steps} (z={z_pos:.2f} mm)")
+                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{feedrate:.1f}", timeout=60.0)
+                self._ender_sync_cmd("M400", timeout=60.0)
                 time.sleep(_HY_STEP_SETTLE_S)
+                f_g = self._sample_scale_latest(window_s=_SCALE_SAMPLE_WINDOW_S)
+                f_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
                 step_frames = self._hy_collect_frames(_HY_FRAMES_PER_STEP, timeout_s=3.0)
                 if step_frames is None:
                     ramp_aborted = True
                     break
-                all_load_steps.append((step_i, z_pos, step_frames))
+                load_steps.append((step_i, z_pos, step_frames, f_n))
 
-            if ramp_aborted or not all_load_steps:
+            if ramp_aborted or not load_steps:
+                sweep_aborted = True
                 break
 
-            time.sleep(_Z_SETTLE_S)
-            f_g = self._sample_scale_latest(window_s=_SCALE_SAMPLE_WINDOW_S)
-            f_actual_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
-
-            # ── Unloading ramp: z_thresh → Z=0 in 0.1 mm steps (contact zone only) ─
-            n_unload = max(1, round(abs(z_thresh_mm) / _HY_RAMP_STEP_MM))
-            z_unload: list[float] = [
-                z_thresh_mm + _HY_RAMP_STEP_MM * (i + 1) for i in range(n_unload)
-            ]
-            z_unload[-1] = 0.0
-
-            all_unload_steps: list[tuple[int, float, list[tuple[list[MarkerRecord], float]]]] = []
-            for step_i, z_pos in enumerate(z_unload):
+            # ── Unloading ramp: -max_depth → Z=0 (immediate reversal, no dwell) ─
+            unload_steps: list[LoadStep] = []
+            for step_i in range(n_steps):
                 if self._hy_stop_ev.is_set():
                     ramp_aborted = True
                     break
+                z_pos = round(-max_depth + _HY_RAMP_STEP_MM * (step_i + 1), 4)
+                if step_i == n_steps - 1:
+                    z_pos = 0.0
                 self._hy_post("progress",
-                    f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  "
-                    f"unloading {step_i + 1}/{n_unload} (z={z_pos:.2f} mm)")
-                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{_HY_RAMP_FEEDRATE}", timeout=15.0)
-                self._ender_sync_cmd("M400", timeout=15.0)
+                    f"Speed {speed_idx + 1}/{n_speeds} ({speed_mm_s} mm/s) | "
+                    f"unloading {step_i + 1}/{n_steps} (z={z_pos:.2f} mm)")
+                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{feedrate:.1f}", timeout=60.0)
+                self._ender_sync_cmd("M400", timeout=60.0)
                 time.sleep(_HY_STEP_SETTLE_S)
+                f_g = self._sample_scale_latest(window_s=_SCALE_SAMPLE_WINDOW_S)
+                f_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
                 step_frames = self._hy_collect_frames(_HY_FRAMES_PER_STEP, timeout_s=3.0)
                 if step_frames is None:
                     ramp_aborted = True
                     break
-                all_unload_steps.append((step_i, z_pos, step_frames))
+                unload_steps.append((step_i, z_pos, step_frames, f_n))
 
-            # Fast retract from Z=0 to z_retract — no recording above surface
-            if not ramp_aborted:
-                self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F{_HY_APPROACH_FEEDRATE}", timeout=15.0)
-                self._ender_sync_cmd("M400", timeout=15.0)
-
-            if ramp_aborted or not all_unload_steps:
+            if ramp_aborted or not unload_steps:
+                sweep_aborted = True
                 break
 
-            last_load_records   = all_load_steps[-1][2][-1][0]
-            last_unload_records = all_unload_steps[-1][2][-1][0]
-            mid_loss = (
-                sum(1 for r in last_load_records   if not r.autofilled) < n_baseline - 1 or
-                sum(1 for r in last_unload_records if not r.autofilled) < n_baseline - 1
-            )
+            # Fast retract between speeds
+            self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F{_HY_APPROACH_FEEDRATE}", timeout=15.0)
+            self._ender_sync_cmd("M400", timeout=15.0)
 
-            self._hy_per_bin_status[bin_lbl] = {"mid_loss": mid_loss, "HI_pct": None}
-
-            if mid_loss:
-                consec_failures += 1
-                self._hy_post("progress",
-                    f"Bin: {idx + 1}/{total}  |  {bin_lbl}  |  tracking loss "
-                    f"({consec_failures}/{_TRACKING_LOSS_STRIKES})")
-                if consec_failures >= _TRACKING_LOSS_STRIKES:
-                    self._hy_bins_skipped.append(bin_id)
-                    self._hy_post("warn_dialog",
-                        f"Bin {bin_lbl}: {_TRACKING_LOSS_STRIKES} consecutive tracking-loss "
-                        f"failures — bin flagged as skipped.")
-                    consec_failures = 0
-            else:
-                consec_failures = 0
-                assert self._hy_writer is not None
-                global_fi = 0
-                for (step_i, z_pos, step_frames) in all_load_steps:
-                    for (records, ts_ms) in step_frames:
-                        self._hy_writer.buffer_frame(
-                            records, global_fi, ts_ms, "loading",
-                            step_i, z_pos, bin_id, x_mm, y_mm, float("nan"),
-                        )
-                        global_fi += 1
-                self._hy_writer.backfill_loading_force(f_actual_n)
-                global_fi = 0
-                for (step_i, z_pos, step_frames) in all_unload_steps:
-                    for (records, ts_ms) in step_frames:
-                        self._hy_writer.buffer_frame(
-                            records, global_fi, ts_ms, "unloading",
-                            step_i, z_pos, bin_id, x_mm, y_mm, float("nan"),
-                        )
-                        global_fi += 1
-                self._hy_writer.flush_bin()
-                self._hy_bins_completed.append(bin_id)
-                self._hy_checkpoint.save(
-                    session_dir=self._hy_session_dir,
-                    session_ts=self._hy_session_ts,
-                    blend_id=self._hy_blend_id,
-                    z_retract_mm=self._hy_z_retract_mm,
-                    completed_bin_ids=list(self._hy_bins_completed),
-                    skipped_bin_ids=list(self._hy_bins_skipped),
-                    csv_path=self._hy_writer.csv_path,
-                )
-
-            self._hy_post("progress_frac", (idx + 1) / total)
+            # Write speed data to CSV
+            assert self._hy_writer is not None
+            global_fi = 0
+            for (step_i, z_pos, step_frames, f_n) in load_steps:
+                for (records, ts_ms) in step_frames:
+                    self._hy_writer.buffer_frame(
+                        records, global_fi, ts_ms, "loading",
+                        step_i, z_pos, 18, x_mm, y_mm, f_n, speed_mm_s,
+                    )
+                    global_fi += 1
+            global_fi = 0
+            for (step_i, z_pos, step_frames, f_n) in unload_steps:
+                for (records, ts_ms) in step_frames:
+                    self._hy_writer.buffer_frame(
+                        records, global_fi, ts_ms, "unloading",
+                        step_i, z_pos, 18, x_mm, y_mm, f_n, speed_mm_s,
+                    )
+                    global_fi += 1
+            self._hy_writer.flush_bin()
+            self._hy_post("progress_frac", (speed_idx + 1) / n_speeds)
 
         if self._hy_writer is not None:
             self._hy_writer.close()
 
-        if not self._hy_stop_ev.is_set():
+        if not sweep_aborted and not self._hy_stop_ev.is_set():
             self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
             self._ender_sync_cmd("M400", timeout=30.0)
             self._ender_sync_cmd("G90", timeout=10.0)
             self._ender_sync_cmd("G1 X0 Y0 F3000", timeout=30.0)
             self._ender_sync_cmd("M400", timeout=30.0)
-            for bentry in GRID_7X5:
-                lbl = f"B{bentry['bin_id']:02d}"
-                if lbl not in self._hy_per_bin_status:
-                    self._hy_per_bin_status[lbl] = {"mid_loss": False, "HI_pct": None}
             write_hysteresis_summary(
                 self._hy_session_dir, self._hy_blend_id, self._hy_session_ts,
-                self._hy_z_retract_mm,
-                list(self._hy_bins_completed), list(self._hy_bins_skipped),
-                self._hy_per_bin_status,
+                self._hy_z_retract_mm, [18], [], {},
             )
-            skipped_labels = [f"B{b:02d}" for b in sorted(self._hy_bins_skipped)]
-            skipped_str = ", ".join(skipped_labels) if skipped_labels else "none"
+            speeds_str = ", ".join(str(s) for s in _HY_SPEEDS_MM_S)
             self._hy_post("done_text",
-                f"Bins complete:  {len(self._hy_bins_completed)} / 35\n"
-                f"Bins skipped:   {skipped_str}")
+                f"Complete — {n_speeds} speeds: {speeds_str} mm/s")
             self._hy_post("progress_frac", 1.0)
             self._hy_post("set_state", HY_PANEL_DONE)
         else:
