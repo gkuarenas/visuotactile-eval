@@ -136,33 +136,25 @@ def plot_hysteresis_loops(
 
         for speed in speeds:
             color = speed_colors[speed]
-            load_arrays, unload_arrays = [], []
+            spd_label = f"{speed} mm/s — " if len(speeds) > 1 else ""
 
+            first = True
             for slab in slabs:
                 sc = slab.get("per_speed", {}).get(speed)
                 if sc is None:
                     continue
                 lc = sc["load_curve"].sort_values("pen")
                 uc = sc["unload_curve"].sort_values("pen")
-                if not lc.empty and not uc.empty:
-                    load_arrays.append((lc["pen"].values, lc["force_n"].values * 1000.0))
-                    unload_arrays.append((uc["pen"].values, uc["force_n"].values * 1000.0))
+                if lc.empty or uc.empty:
+                    continue
 
-            if not load_arrays:
-                continue
-
-            pen_max  = max(a[0][-1] for a in load_arrays)
-            pen_grid = np.linspace(0.0, pen_max, 200)
-            load_mat   = np.array([np.interp(pen_grid, a[0], a[1]) for a in load_arrays])
-            unload_mat = np.array([np.interp(pen_grid, a[0], a[1]) for a in unload_arrays])
-            mean_load   = np.mean(load_mat,   axis=0)
-            mean_unload = np.mean(unload_mat, axis=0)
-
-            spd_label = f"{speed} mm/s — " if len(speeds) > 1 else ""
-            ax.plot(pen_grid, mean_load,   "-",  color=color, lw=0.8,
-                    label=f"{spd_label}Loading")
-            ax.plot(pen_grid, mean_unload, "--", color=color, lw=0.8,
-                    label=f"{spd_label}Unloading")
+                ax.plot(lc["pen"].values, lc["force_n"].values * 1000.0,
+                        "-",  color=color, lw=0.8, alpha=0.6,
+                        label=f"{spd_label}Loading"   if first else "_nolegend_")
+                ax.plot(uc["pen"].values, uc["force_n"].values * 1000.0,
+                        "--", color=color, lw=0.8, alpha=0.6,
+                        label=f"{spd_label}Unloading" if first else "_nolegend_")
+                first = False
 
         # HI annotation: use per-speed values when a single speed is displayed
         if len(speeds) == 1:
