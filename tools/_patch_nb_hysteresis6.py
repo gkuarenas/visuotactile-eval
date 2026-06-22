@@ -115,6 +115,18 @@ def _load_hysteresis_slab(sdir):
         area_u = float(_trapz(udf["force_n"].values, udf["pen"].values))
         hi = (area_l - area_u) / area_l * 100.0 if area_l > 0 else float("nan")
         hi_per_speed[speed] = hi
+
+        # Close the loop at zero-force / zero-depth: at F=0, penetration is 0
+        # by definition (no contact).  Prepending (0, 0) to the unloading curve
+        # closes the visual loop without fabricating measured data — it is a
+        # physical boundary condition, not an interpolated point.  HI is
+        # intentionally computed above (before this prepend) so the area
+        # calculation uses only the directly corrected measurements.
+        udf = pd.concat(
+            [pd.DataFrame({"pen": [0.0], "force_n": [0.0]}), udf],
+            ignore_index=True,
+        ).sort_values("pen").reset_index(drop=True)
+
         per_speed[speed] = {
             "load_curve":   ldf[["pen", "force_n"]].copy(),
             "unload_curve": udf[["pen", "force_n"]].copy(),
