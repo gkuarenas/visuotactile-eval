@@ -3,14 +3,10 @@ import json
 import os
 from datetime import datetime
 
-from core.tracker import MarkerRecord
-
 HYSTERESIS_COLUMNS = [
     "bin_id", "bin_x_mm", "bin_y_mm", "phase",
     "ramp_step", "z_depth_mm", "speed_mm_s",
-    "frame", "timestamp_ms",
-    "marker_id", "dx_mm", "dy_mm", "delta_z_mm", "abs_delta_z_mm",
-    "mean_abs_delta_z_mm", "f_actual_n", "autofilled",
+    "timestamp_ms", "f_actual_n",
 ]
 
 
@@ -35,45 +31,29 @@ class HysteresisWriter:
             self._w.writeheader()
         self._pending: list[dict[str, object]] = []
 
-    def buffer_frame(
+    def buffer_step(
         self,
-        records: list[MarkerRecord],
-        frame_idx: int,
-        timestamp_ms: float,
         phase: str,
         ramp_step: int,
         z_depth_mm: float,
+        speed_mm_s: float,
         bin_id: int,
         bin_x_mm: float,
         bin_y_mm: float,
         f_actual_n: float,
-        speed_mm_s: float,
+        timestamp_ms: float,
     ) -> None:
-        valid = [r for r in records if not r.autofilled]
-        mean_abs: float = (
-            sum(abs(r.delta_z_mm) for r in valid) / len(valid)
-            if valid else float("nan")
-        )
-        for r in records:
-            self._pending.append({
-                "bin_id":               bin_id,
-                "bin_x_mm":            round(bin_x_mm, 3),
-                "bin_y_mm":            round(bin_y_mm, 3),
-                "phase":               phase,
-                "ramp_step":           ramp_step,
-                "z_depth_mm":          round(z_depth_mm, 4),
-                "speed_mm_s":          speed_mm_s,
-                "frame":               frame_idx,
-                "timestamp_ms":        round(timestamp_ms),
-                "marker_id":           r.marker_id,
-                "dx_mm":               round(r.dx_mm, 6),
-                "dy_mm":               round(r.dy_mm, 6),
-                "delta_z_mm":          round(r.delta_z_mm, 6),
-                "abs_delta_z_mm":      round(abs(r.delta_z_mm), 6),
-                "mean_abs_delta_z_mm": round(mean_abs, 6),
-                "f_actual_n":          round(float(f_actual_n), 6),
-                "autofilled":          r.autofilled,
-            })
+        self._pending.append({
+            "bin_id":       bin_id,
+            "bin_x_mm":    round(bin_x_mm, 3),
+            "bin_y_mm":    round(bin_y_mm, 3),
+            "phase":       phase,
+            "ramp_step":   ramp_step,
+            "z_depth_mm":  round(z_depth_mm, 4),
+            "speed_mm_s":  speed_mm_s,
+            "timestamp_ms": round(timestamp_ms),
+            "f_actual_n":  round(float(f_actual_n), 6),
+        })
 
     def flush_bin(self) -> None:
         if self._pending:
@@ -127,7 +107,7 @@ def plot_hysteresis_loops(
         pass
 
     if speeds is None:
-        speeds = [0.1, 0.5, 1.0, 2.0, 3.5]
+        speeds = [0.1, 0.5, 1.0]
 
     loaded = [lbl for lbl in blend_order if hy_data.get(lbl)]
     if not loaded:
@@ -165,8 +145,8 @@ def plot_hysteresis_loops(
                 lc = sc["load_curve"].sort_values("pen")
                 uc = sc["unload_curve"].sort_values("pen")
                 if not lc.empty and not uc.empty:
-                    load_arrays.append((lc["pen"].values, lc["force_n"].values))
-                    unload_arrays.append((uc["pen"].values, uc["force_n"].values))
+                    load_arrays.append((lc["pen"].values, lc["force_n"].values * 1000.0))
+                    unload_arrays.append((uc["pen"].values, uc["force_n"].values * 1000.0))
 
             if not load_arrays:
                 continue
@@ -178,15 +158,31 @@ def plot_hysteresis_loops(
             mean_load   = np.mean(load_mat,   axis=0)
             mean_unload = np.mean(unload_mat, axis=0)
 
-            ax.plot(pen_grid, mean_load,   "-",  color=color, lw=0.8, label=f"{speed} mm/s")
-            ax.plot(pen_grid, mean_unload, "--", color=color, lw=0.8, label="_")
+            spd_label = f"{speed} mm/s — " if len(speeds) > 1 else ""
+            ax.plot(pen_grid, mean_load,   "-",  color=color, lw=0.8,
+                    label=f"{spd_label}Loading")
+            ax.plot(pen_grid, mean_unload, "--", color=color, lw=0.8,
+                    label=f"{spd_label}Unloading")
+            ax.plot([pen_grid[-1], pen_grid[-1]],
+                    [mean_load[-1], mean_unload[-1]],
+                    "-", color=color, lw=0.8)
 
-        if len(hi_vals) > 1:
-            hi_str = f"HI = {np.mean(hi_vals):.1f} ± {np.std(hi_vals, ddof=1):.1f}%"
-        elif hi_vals:
-            hi_str = f"HI = {hi_vals[0]:.1f}%"
+        # HI annotation: use per-speed values when a single speed is displayed
+        if len(speeds) == 1:
+            sp = speeds[0]
+            hi_vals = [
+                float(s["HI_per_speed"][sp])
+                for s in slabs
+                if s.get("HI_per_speed", {}).get(sp) is not None
+                and not np.isnan(float(s["HI_per_speed"][sp]))
+            ]
+        abs_hi_vals = [abs(v) for v in hi_vals]
+        if len(abs_hi_vals) > 1:
+            hi_str = f"|HI| = {np.mean(abs_hi_vals):.1f} ± {np.std(abs_hi_vals, ddof=1):.1f}%"
+        elif abs_hi_vals:
+            hi_str = f"|HI| = {abs_hi_vals[0]:.1f}%"
         else:
-            hi_str = "HI = —"
+            hi_str = "|HI| = —"
 
         ax.text(0.97, 0.05, hi_str,
                 transform=ax.transAxes, ha="right", va="bottom", fontsize=fontsize_annot,
@@ -194,21 +190,14 @@ def plot_hysteresis_loops(
                           edgecolor="none", alpha=0.8))
         ax.set_title(blend_titles.get(lbl, lbl), fontsize=fontsize_title)
         ax.set_xlabel("Penetration depth (mm)", fontsize=fontsize_label)
-        ax.set_ylabel("Force (N)", fontsize=fontsize_label)
+        ax.set_ylabel("Force (mN)", fontsize=fontsize_label)
         ax.tick_params(labelsize=fontsize_tick, direction="in", top=True, right=True)
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
 
-        speed_handles, speed_labels = ax.get_legend_handles_labels()
-        shown = [(h, l) for h, l in zip(speed_handles, speed_labels) if l != "_"]
-        style_entries = [
-            (Line2D([0], [0], color="black", lw=0.8, ls="-"),  "Loading"),
-            (Line2D([0], [0], color="black", lw=0.8, ls="--"), "Unloading"),
-        ]
-        all_entries = shown + style_entries
-        if all_entries:
-            ax.legend(*zip(*all_entries), fontsize=fontsize_legend, ncol=1,
-                      loc="upper left")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize=fontsize_legend, ncol=1, loc="upper left")
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)

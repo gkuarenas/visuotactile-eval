@@ -134,12 +134,16 @@ _ST_PLOT_W_PX        = 400
 _ST_PLOT_H_PX        = 160
 
 # ── Hysteresis panel constants ────────────────────────────────────────────────
-_HY_MAX_DEPTH_MM      = 3.5    # default indentation depth for hysteresis ramp
-_HY_SPEEDS_MM_S       = [0.1, 0.5, 1.0, 2.0, 3.5]   # indenter speeds tested
-_HY_RAMP_STEP_MM      = 0.1    # depth increment per ramp step
-_HY_FRAMES_PER_STEP   = 3      # frames recorded at each depth level (30 fps ≈ 100 ms)
-_HY_STEP_SETTLE_S     = 0.05   # mechanical settle after each G1 move — no viscoelastic wait
+_HY_MAX_DEPTH_MM      = 4.0    # default indentation depth for hysteresis ramp
+_HY_SPEEDS_MM_S       = [0.1, 0.5, 1.0]   # indenter speeds tested
+_HY_STEP_SETTLE_S     = 0.3    # surface-contact settle before each ramp (post-approach)
+_HY_DWELL_S           = 0.0    # no hold — any dwell at max depth causes soft-contact creep
+                                # that inverts the hysteresis loop; M400 latency provides the
+                                # only implicit pause (~10ms at 0.5–1.0 mm/s)
 _HY_APPROACH_FEEDRATE = 3000   # mm/min — fast travel to/from Z=0 (no recording)
+_HY_POLL_INTERVAL_S   = 0.05   # 50 ms between force samples during continuous ramp
+_HY_POLL_WINDOW_S     = 0.1    # 100 ms HX711 averaging window (~1–2 readings at 16 Hz)
+                                # halves the centroid lag vs 200 ms (100 ms → 50 ms)
 
 
 # ── Module helpers ────────────────────────────────────────────────────────────
@@ -395,6 +399,7 @@ class SensitivityWindow(ctk.CTk):
         self._apply_visibility()
         self.after(200, self._poll_scale_calib_q)
         self.after(200, self._poll_v4_force_display)
+        self.after(200, self._poll_hy_force_live)
         self.after(100, self._poll_st_msg_q)
         self.after(100, self._poll_hy_msg_q)
 
@@ -549,6 +554,16 @@ class SensitivityWindow(ctk.CTk):
                 n = (g / 1000.0) * _GRAVITY_MPS2
                 self._v4_force_var.set(f"Force: {g:.1f} g  /  {n:.4f} N")
         self.after(200, self._poll_v4_force_display)
+
+    def _poll_hy_force_live(self) -> None:
+        if self._hy_state != HY_PANEL_SWEEPING:
+            g = self._sample_scale_latest()
+            if np.isnan(g):
+                self._hy_force_var.set("F: — N")
+            else:
+                n = (g / 1000.0) * _GRAVITY_MPS2
+                self._hy_force_var.set(f"F: {n * 1000:.1f} mN")
+        self.after(200, self._poll_hy_force_live)
 
     def _build_com_section(self, parent) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent)
@@ -922,11 +937,22 @@ class SensitivityWindow(ctk.CTk):
             command=self._hy_on_estop, state="disabled",
         )
         self._hy_estop_btn.pack(side="left", padx=(0, 6))
+        self._hy_stopreset_btn = ctk.CTkButton(
+            btn_row, text="Stop / Reset", width=100,
+            fg_color="orange4", hover_color="orange3",
+            command=self._hy_on_stop_reset, state="disabled",
+        )
+        self._hy_stopreset_btn.pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             btn_row, text="Return to Hub", width=110,
             fg_color="gray40", hover_color="gray30",
             command=self._hy_on_return_to_hub,
         ).pack(side="left")
+
+        self._hy_force_var = ctk.StringVar(value="F: — N")
+        ctk.CTkLabel(f, textvariable=self._hy_force_var,
+                     font=ctk.CTkFont(family="Courier", size=12, weight="bold"),
+                     anchor="w").pack(fill="x", padx=8, pady=(4, 0))
 
         self._hy_progress_var = ctk.StringVar(value="")
         ctk.CTkLabel(f, textvariable=self._hy_progress_var,
@@ -1003,6 +1029,9 @@ class SensitivityWindow(ctk.CTk):
         if hasattr(self, "_hy_start_btn"):
             self._hy_start_btn.configure(state="normal" if s == HY_PANEL_IDLE else "disabled")
             self._hy_estop_btn.configure(state="normal" if s == HY_PANEL_SWEEPING else "disabled")
+            self._hy_stopreset_btn.configure(
+                state="normal" if s in (HY_PANEL_SWEEPING, HY_PANEL_DONE) else "disabled"
+            )
             if s == HY_PANEL_DONE:
                 self._hy_done_lbl.pack(fill="x", padx=8, pady=(0, 6))
             elif hasattr(self, "_hy_done_lbl"):
@@ -1292,7 +1321,6 @@ class SensitivityWindow(ctk.CTk):
             self._diag_frame = diag
             self._diag_frame_until = time.time() + 3.0
 
-        self._hy_session_info_var.set(f"Session: {self._session_dir or '—'}")
         self._set_state(HUB)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2911,6 +2939,12 @@ class SensitivityWindow(ctk.CTk):
                 if key == "set_state" and isinstance(value, int):
                     self._hy_state = value
                     self._set_state(value)
+                elif key == "force_n" and isinstance(value, float):
+                    import math as _math
+                    if _math.isnan(value):
+                        self._hy_force_var.set("F: — N")
+                    else:
+                        self._hy_force_var.set(f"F: {value * 1000:.1f} mN")
                 elif key == "progress":
                     self._hy_progress_var.set(str(value))
                 elif key == "progress_frac" and isinstance(value, float):
@@ -2978,20 +3012,147 @@ class SensitivityWindow(ctk.CTk):
         self._hy_worker = threading.Thread(target=self._hy_worker_fn, daemon=True)
         self._hy_worker.start()
 
+    def _hy_continuous_ramp(
+        self,
+        phase: str,
+        z_start: float,
+        z_end: float,
+        speed_mm_s: float,
+        bin_id: int,
+        bin_x_mm: float,
+        bin_y_mm: float,
+    ) -> None:
+        """Issue one continuous G1 move at the exact test feedrate and poll the
+        load cell every _HY_POLL_INTERVAL_S during motion.  Z position is
+        estimated from elapsed time; at ≤1 mm/s the acceleration phase is <2 ms
+        so the linear estimate is accurate to <0.01 mm."""
+        distance   = abs(z_end - z_start)
+        feedrate   = speed_mm_s * 60.0
+        direction  = -1.0 if z_end < z_start else 1.0
+        expected_s = distance / speed_mm_s
+
+        # G1 is acknowledged by Marlin ("ok") the moment it is queued in the
+        # motion planner — motion starts essentially at t0.
+        self._ender_sync_cmd(f"G1 Z{z_end:.3f} F{feedrate:.1f}", timeout=10.0)
+        t0     = time.time()
+        step_i = 0
+
+        while True:
+            elapsed = time.time() - t0
+            z_est   = round(z_start + direction * min(distance, speed_mm_s * elapsed), 4)
+            f_g     = self._sample_scale_latest(window_s=_HY_POLL_WINDOW_S)
+            f_n     = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
+
+            self._hy_writer.buffer_step(
+                phase=phase, ramp_step=step_i, z_depth_mm=z_est,
+                speed_mm_s=speed_mm_s, bin_id=bin_id,
+                bin_x_mm=bin_x_mm, bin_y_mm=bin_y_mm,
+                f_actual_n=f_n, timestamp_ms=time.time() * 1000.0,
+            )
+            self._hy_post("force_n", f_n)
+            step_i += 1
+
+            if elapsed >= expected_s or self._hy_stop_ev.is_set():
+                break
+            time.sleep(_HY_POLL_INTERVAL_S)
+
+        self._hy_writer.flush_bin()
+        # Block until the physical move is complete before the caller continues.
+        self._ender_sync_cmd("M400", timeout=expected_s * 2.0 + 5.0)
+
+    def _hy_roundtrip_ramp(
+        self,
+        z_surface: float,
+        z_depth: float,
+        speed_mm_s: float,
+        speed_idx: int,
+        n_speeds: int,
+        bin_id: int,
+        bin_x_mm: float,
+        bin_y_mm: float,
+    ) -> bool:
+        """Queue loading and unloading G1 commands back-to-back before polling.
+        Marlin executes them continuously with no pause at the turning point,
+        eliminating the ~260 ms M400 turnaround gap.
+        Phase is determined from elapsed time.
+        Returns True if completed normally, False if stop was requested."""
+        feedrate      = speed_mm_s * 60.0
+        distance      = abs(z_depth - z_surface)
+        load_duration = distance / speed_mm_s
+        total_s       = 2.0 * load_duration
+
+        # Queue both moves. Each 'ok' arrives within ~10 ms (queued, not executed).
+        # Marlin executes loading then unloading with zero pause between them.
+        self._ender_sync_cmd(f"G1 Z{z_depth:.3f} F{feedrate:.1f}", timeout=10.0)
+        t0 = time.time()
+        self._ender_sync_cmd(f"G1 Z{z_surface:.3f} F{feedrate:.1f}", timeout=10.0)
+
+        step_i     = 0
+        last_phase = None
+
+        while True:
+            elapsed = time.time() - t0
+
+            if elapsed < load_duration:
+                phase = "loading"
+                z_est = round(z_surface - min(distance, speed_mm_s * elapsed), 4)
+            else:
+                phase = "unloading"
+                elapsed_u = elapsed - load_duration
+                z_est = round(z_depth + min(distance, speed_mm_s * elapsed_u), 4)
+
+            if phase != last_phase:
+                self._hy_post("progress",
+                    f"Speed {speed_idx+1}/{n_speeds} ({speed_mm_s} mm/s) | {phase}")
+                last_phase = phase
+
+            f_g = self._sample_scale_latest(window_s=_HY_POLL_WINDOW_S)
+            f_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
+
+            self._hy_writer.buffer_step(
+                phase=phase, ramp_step=step_i, z_depth_mm=z_est,
+                speed_mm_s=speed_mm_s, bin_id=bin_id,
+                bin_x_mm=bin_x_mm, bin_y_mm=bin_y_mm,
+                f_actual_n=f_n, timestamp_ms=time.time() * 1000.0,
+            )
+            self._hy_post("force_n", f_n)
+            step_i += 1
+
+            if elapsed >= total_s or self._hy_stop_ev.is_set():
+                break
+            time.sleep(_HY_POLL_INTERVAL_S)
+
+        self._hy_writer.flush_bin()
+        # Wait for both moves to finish. If stop was requested during loading the
+        # queued unloading G1 still runs — the Ender self-retracts before M400 returns.
+        self._ender_sync_cmd("M400", timeout=total_s * 2.0 + 5.0)
+        return not self._hy_stop_ev.is_set()
+
     def _hy_worker_fn(self) -> None:
         center_bin = next(b for b in GRID_7X5 if b["bin_id"] == 18)
         x_mm      = center_bin["x_mm"]
         y_mm      = center_bin["y_mm"]
         z_retract = self._hy_z_retract_mm
         max_depth = self._hy_max_depth_mm
-        n_steps   = max(1, round(max_depth / _HY_RAMP_STEP_MM))
         n_speeds  = len(_HY_SPEEDS_MM_S)
+
+        assert self._hy_writer is not None
 
         self._ender_sync_cmd("G90", timeout=10.0)
         self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
         self._ender_sync_cmd("M400", timeout=30.0)
         self._ender_sync_cmd(f"G1 X{x_mm:.3f} Y{y_mm:.3f} F3000", timeout=30.0)
         self._ender_sync_cmd("M400", timeout=30.0)
+        # Raise Z max feedrate and acceleration so all speeds are achievable
+        # even on short 0.1 mm steps.  Restored after sweep in both paths.
+        self._ender_sync_cmd("M203 Z12", timeout=5.0)   # max Z feedrate: 12 mm/s
+        self._ender_sync_cmd("M201 Z500", timeout=5.0)  # Z acceleration: 500 mm/s²
+
+        # Tare at clearance before the first ramp (probe not in contact).
+        # Speeds 2+ get re-tared in the per-speed retract block; speed 1 needs this.
+        self._hy_post("progress", "Taring before sweep…")
+        self._retare_scale_if_connected()
+        time.sleep(0.5)
 
         sweep_aborted = False
 
@@ -2999,8 +3160,6 @@ class SensitivityWindow(ctk.CTk):
             if self._hy_stop_ev.is_set():
                 sweep_aborted = True
                 break
-
-            feedrate = speed_mm_s * 60.0  # mm/s → mm/min
 
             self._hy_post("progress",
                 f"Speed {speed_idx + 1}/{n_speeds} ({speed_mm_s} mm/s) | approaching surface")
@@ -3010,89 +3169,31 @@ class SensitivityWindow(ctk.CTk):
             self._ender_sync_cmd("M400", timeout=15.0)
             time.sleep(_HY_STEP_SETTLE_S)
 
-            # ── Loading ramp: Z=0 → -max_depth ───────────────────────────────
-            LoadStep = tuple[int, float, list[tuple[list[MarkerRecord], float]], float]
-            load_steps: list[LoadStep] = []
-            ramp_aborted = False
-            for step_i in range(n_steps + 1):
-                if self._hy_stop_ev.is_set():
-                    ramp_aborted = True
-                    break
-                z_pos = round(-_HY_RAMP_STEP_MM * step_i, 4)
-                if step_i == n_steps:
-                    z_pos = -max_depth
-                self._hy_post("progress",
-                    f"Speed {speed_idx + 1}/{n_speeds} ({speed_mm_s} mm/s) | "
-                    f"loading {step_i + 1}/{n_steps} (z={z_pos:.2f} mm)")
-                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{feedrate:.1f}", timeout=60.0)
-                self._ender_sync_cmd("M400", timeout=60.0)
-                time.sleep(_HY_STEP_SETTLE_S)
-                f_g = self._sample_scale_latest(window_s=_SCALE_SAMPLE_WINDOW_S)
-                f_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
-                step_frames = self._hy_collect_frames(_HY_FRAMES_PER_STEP, timeout_s=3.0)
-                if step_frames is None:
-                    ramp_aborted = True
-                    break
-                load_steps.append((step_i, z_pos, step_frames, f_n))
-
-            if ramp_aborted or not load_steps:
+            # ── Continuous roundtrip: loading + unloading queued back-to-back ──
+            # Both G1 commands are sent before polling starts so Marlin executes
+            # them with no pause at the turning point (~0 ms vs previous ~260 ms).
+            if not self._hy_roundtrip_ramp(
+                0.0, -max_depth, speed_mm_s, speed_idx, n_speeds, 18, x_mm, y_mm,
+            ):
                 sweep_aborted = True
                 break
 
-            # ── Unloading ramp: -max_depth → Z=0 (immediate reversal, no dwell) ─
-            unload_steps: list[LoadStep] = []
-            for step_i in range(n_steps):
-                if self._hy_stop_ev.is_set():
-                    ramp_aborted = True
-                    break
-                z_pos = round(-max_depth + _HY_RAMP_STEP_MM * (step_i + 1), 4)
-                if step_i == n_steps - 1:
-                    z_pos = 0.0
-                self._hy_post("progress",
-                    f"Speed {speed_idx + 1}/{n_speeds} ({speed_mm_s} mm/s) | "
-                    f"unloading {step_i + 1}/{n_steps} (z={z_pos:.2f} mm)")
-                self._ender_sync_cmd(f"G1 Z{z_pos:.3f} F{feedrate:.1f}", timeout=60.0)
-                self._ender_sync_cmd("M400", timeout=60.0)
-                time.sleep(_HY_STEP_SETTLE_S)
-                f_g = self._sample_scale_latest(window_s=_SCALE_SAMPLE_WINDOW_S)
-                f_n = (f_g / 1000.0) * _GRAVITY_MPS2 if not np.isnan(f_g) else float("nan")
-                step_frames = self._hy_collect_frames(_HY_FRAMES_PER_STEP, timeout_s=3.0)
-                if step_frames is None:
-                    ramp_aborted = True
-                    break
-                unload_steps.append((step_i, z_pos, step_frames, f_n))
-
-            if ramp_aborted or not unload_steps:
-                sweep_aborted = True
-                break
-
-            # Fast retract between speeds
+            # ── Retract, stabilise 3 s, tare for next speed ───────────────────
             self._ender_sync_cmd(f"G1 Z{z_retract:.3f} F{_HY_APPROACH_FEEDRATE}", timeout=15.0)
             self._ender_sync_cmd("M400", timeout=15.0)
+            self._hy_post("progress",
+                f"Speed {speed_idx + 1}/{n_speeds} ({speed_mm_s} mm/s) | taring…")
+            time.sleep(3.0)
+            self._retare_scale_if_connected()
 
-            # Write speed data to CSV
-            assert self._hy_writer is not None
-            global_fi = 0
-            for (step_i, z_pos, step_frames, f_n) in load_steps:
-                for (records, ts_ms) in step_frames:
-                    self._hy_writer.buffer_frame(
-                        records, global_fi, ts_ms, "loading",
-                        step_i, z_pos, 18, x_mm, y_mm, f_n, speed_mm_s,
-                    )
-                    global_fi += 1
-            global_fi = 0
-            for (step_i, z_pos, step_frames, f_n) in unload_steps:
-                for (records, ts_ms) in step_frames:
-                    self._hy_writer.buffer_frame(
-                        records, global_fi, ts_ms, "unloading",
-                        step_i, z_pos, 18, x_mm, y_mm, f_n, speed_mm_s,
-                    )
-                    global_fi += 1
-            self._hy_writer.flush_bin()
             self._hy_post("progress_frac", (speed_idx + 1) / n_speeds)
 
         if self._hy_writer is not None:
             self._hy_writer.close()
+
+        # Restore Z kinematics to Ender 3 defaults regardless of outcome
+        self._ender_sync_cmd("M201 Z100", timeout=5.0)
+        self._ender_sync_cmd("M203 Z5",   timeout=5.0)
 
         if not sweep_aborted and not self._hy_stop_ev.is_set():
             self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
@@ -3110,7 +3211,11 @@ class SensitivityWindow(ctk.CTk):
             self._hy_post("progress_frac", 1.0)
             self._hy_post("set_state", HY_PANEL_DONE)
         else:
-            self._hy_post("status", "Sweep aborted — partial data saved.")
+            self._hy_post("progress", "Aborting — retracting to clearance…")
+            self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F{_HY_APPROACH_FEEDRATE}", timeout=30.0)
+            self._ender_sync_cmd("M400", timeout=30.0)
+            self._hy_post("status", "Sweep aborted — partial data saved. Ready to restart.")
+            self._hy_post("progress", "")
             self._hy_post("set_state", HY_PANEL_IDLE)
 
     def _hy_collect_frames(
@@ -3131,6 +3236,20 @@ class SensitivityWindow(ctk.CTk):
             return None
         with self._frame_lock:
             return list(self._frame_buffer[:n])
+
+    def _hy_on_stop_reset(self) -> None:
+        if self._hy_state == HY_PANEL_SWEEPING:
+            # Graceful abort — worker exits after the current step and retracts
+            self._hy_stop_ev.set()
+            self._hy_post("status", "Stop requested — finishing current step…")
+        elif self._hy_state == HY_PANEL_DONE:
+            # Reset UI back to idle for a new collection
+            self._hy_progress_var.set("")
+            self._hy_progress_bar.set(0.0)
+            self._hy_force_var.set("F: — N")
+            self._hy_done_var.set("")
+            self._hy_state = HY_PANEL_IDLE
+            self._set_state(HY_PANEL_IDLE)
 
     def _hy_on_estop(self) -> None:
         if self._ender_controller and self._ender_controller.ser \
