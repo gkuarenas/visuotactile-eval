@@ -87,7 +87,12 @@ def _load_hysteresis_slab(sdir):
             ))
         else:
             backlash_mm = 0.0
-        udf["pen"] = (udf["pen"] + backlash_mm).clip(lower=0.0, upper=pen_max)
+        # Only clip below zero — do NOT clip to pen_max.  The early unloading
+        # steps (still at max depth during backlash take-up) will land just above
+        # pen_max after the shift; np.interp in the plot handles them correctly by
+        # interpolating within range.  Clipping to pen_max would collapse those
+        # points onto a single x-value, creating a kink at the top of the curve.
+        udf["pen"] = (udf["pen"] + backlash_mm).clip(lower=0.0)
 
         # Smooth over a 5-step rolling window to reduce load-cell noise (~2 mN).
         ldf["force_n"] = ldf["force_n"].rolling(5, center=True, min_periods=1).mean()
