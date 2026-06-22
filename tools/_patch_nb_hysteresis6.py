@@ -154,12 +154,10 @@ for lbl, paths in HYSTERESIS_SESSIONS.items():
         try:
             s = _load_hysteresis_slab(sdir)
             hy_data[lbl].append(s)
-            n_sp = len(s["speeds"])
-            bl_info = ", ".join(
-                f"{sp} mm/s bl={s['per_speed'][sp]['backlash_mm']:.3f} mm"
-                for sp in s["speeds"] if sp in s["per_speed"]
-            )
-            print(f"{lbl} slab {i+1}: HI_mean={s['HI_mean']:.2f}%  ({n_sp} speeds)  [{bl_info}]")
+            print(f"{lbl} slab {i+1}: " + "  ".join(
+                f"HI@{sp:.1f}={s['HI_per_speed'].get(sp, float('nan')):.1f}%"
+                for sp in s["speeds"]
+            ))
         except Exception as e:
             print(f"{lbl} slab {i+1}: error — {e}")
 
