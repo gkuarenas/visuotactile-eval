@@ -62,13 +62,17 @@ where $\mathcal{W} = \{(t_k, g_k) : t_k \geq t_{\text{now}} - 0.2\ \text{s}\}$, 
 
 ## D. Hysteresis Test Protocol
 
-### D.1 Depth Reference
+### D.1 Indentation Parameters
 
-The hysteresis test operates on a slab for which a sensitivity session has already been completed. The per-slab calibrated threshold $z_{\text{thresh},b}$ for the center bin $B_{18}$ is loaded from the sensitivity session's calibration map and used as the target press depth. This preserves the per-slab calibration: each slab is pressed to the depth that is mechanically meaningful relative to its specific deformation limit, regardless of absolute depth differences across slabs within the same blend.
+Hysteresis characterization was performed on the center bin ($B_{18}$) of each slab using a fixed maximum penetration depth of 6.0 mm and a constant indentation rate of 0.1 mm/s. Unlike the sensitivity protocol (§C), which derives a per-slab collection depth from automated ceiling calibration, the hysteresis test uses a fixed depth across all slabs to place every force–displacement curve on a common penetration axis and enable direct cross-blend comparison.
 
 ### D.2 Loading and Unloading Ramps
 
-The indenter descends to $z_{\text{thresh},B_{18}}$ in discrete ramp steps, recording marker displacements at each step (loading phase). It then ascends back to the contact reference, recording at each step (unloading phase). Each frame is labeled with its ramp step index and phase. One complete loading-unloading traversal constitutes one cycle.
+The indenter descends from the contact reference ($z = 0$) to $z = -6.0$ mm at 0.1 mm/s (loading phase), then retracts to $z = 0$ at the same rate (unloading phase). Motion is executed as a single continuous G-code command (`G1`) at the exact test feedrate, with no intermediate stops or dwell at peak depth. The HX711 load cell is polled at each ramp step; one row is written to the session CSV per step with fields: `bin_id`, `bin_x_mm`, `bin_y_mm`, `phase` (`loading` or `unloading`), `ramp_step`, `z_depth_mm`, `speed_mm_s`, `timestamp_ms`, `f_actual_n`. The depth field `z_depth_mm` is time-derived from motor step timing; the Ender 3 V2 carries no position encoder. After each complete cycle the indenter retracts to a safe clearance height; the load cell is allowed to stabilize for 3 s before a hardware tare zeroes it for the next replicate.
+
+### D.3 Mechanical Backlash
+
+The Ender 3 V2 brass leadscrew nut exhibits mechanical backlash (~0.6 mm) on direction reversal. At the loading-to-unloading turnaround, the carriage remains physically at maximum depth while the time-based depth estimate has already counted upward, shifting the entire unloading depth axis leftward in the raw data. Correction is applied in post-processing (§H.2).
 
 ---
 
@@ -140,29 +144,49 @@ $$\text{Rep} = \frac{1}{|\mathcal{B}|} \sum_{b\,\in\,\mathcal{B}} \sigma_{\text{
 
 ## H. Hysteresis Index
 
-### H.1 Ramp Curves
+### H.1 Force–Displacement Curves
 
-For each loading-unloading cycle, two response curves are formed in penetration-depth space, where penetration depth $p_s = -z_{\text{depth},s} \geq 0$ increases with indenter descent. The mean absolute depth displacement across all non-autofilled markers at ramp step $s$ during the loading phase is:
+For each slab, the raw session CSV is aggregated into two force–penetration-depth curves. Penetration depth is $p_s = |z_{\text{depth},s}| \geq 0$. At each ramp step $s$, the mean force across all sensor bins is computed:
 
-$$\bar{y}_s^{L} = \frac{1}{|\mathcal{M}_s^*|} \sum_{i\,\in\,\mathcal{M}_s^*} |\Delta z_{s,i}|$$
+$$f_s^{L} = \frac{1}{|\mathcal{B}|} \sum_{b \in \mathcal{B}} f_{\text{actual},s,b}$$
 
-and analogously $\bar{y}_s^{U}$ for the unloading phase. The areas under each curve are computed by numerical integration over penetration depth:
+and analogously $f_s^{U}$ for the unloading phase. A baseline subtraction removes the load-cell DC offset by subtracting the force recorded at ramp step 0 (pre-contact, $p = 0$) from all loading and unloading values.
 
-$$A^{L} = \int_0^{p_{\max}} \bar{y}^{L}(p)\,dp \approx \sum_s \bar{y}_s^{L}\,\Delta p_s$$
+### H.2 Backlash Correction
 
-$$A^{U} = \int_0^{p_{\max}} \bar{y}^{U}(p)\,dp \approx \sum_s \bar{y}_s^{U}\,\Delta p_s$$
+The backlash magnitude $p_{\text{bl}}$ is estimated from the residual contact force at the shallow end of the raw unloading curve. At zero true penetration, contact force must be zero; any residual mean force $f_{\text{res}}$ (computed over the lowest 10th percentile of unloading depths) implies the indenter is still physically at depth $p_{\text{bl}}$ on the loading curve:
 
-### H.2 Normalized Hysteresis Index
+$$p_{\text{bl}} = \mathrm{interp}\!\left(f_{\text{res}};\ \mathbf{f}^{L},\ \mathbf{p}^{L}\right)$$
 
-The hysteresis index for a single cycle is defined as the fractional area difference normalized by the loading curve area:
+The unloading depth axis is shifted rightward by $p_{\text{bl}}$, and unloading points whose corrected depth equals or exceeds $p_{\max}$ (the loading maximum) are dropped. These points were recorded while the carriage was still physically at maximum depth during backlash traversal; retaining them inflates $A^{U}$ and inverts the sign of HI. The estimated backlash for the B4 slab at 0.1 mm/s was approximately 0.6 mm.
+
+### H.3 Smoothing and Loop Closure at Maximum Depth
+
+A 5-point centred rolling mean is applied to both force curves to suppress HX711 quantization noise (~2 mN RMS). Smoothing must precede the turnaround-point extraction: the force value at $p_{\max}$ is read from the smoothed loading curve and prepended to the smoothed unloading curve as a shared endpoint, so both curves meet exactly at maximum penetration. Rolling edge effects at the boundary point independently shift each curve's force value if smoothing is applied after the prepend, reintroducing a visible gap. Force values are then clipped to zero to prevent negative readings near the contact threshold.
+
+### H.4 Normalized Hysteresis Index
+
+The areas under the loading and unloading force–depth curves are computed by trapezoidal integration:
+
+$$A^{L} = \int_0^{p_{\max}} f^{L}(p)\,dp, \qquad A^{U} = \int_0^{p_{\max}} f^{U}(p)\,dp$$
+
+The hysteresis index is the fractional area difference normalized by the loading curve area:
 
 $$\text{HI} = \frac{A^{L} - A^{U}}{A^{L}} \times 100\ [\%]$$
 
-Normalization by $A^{L}$ renders HI dimensionless and independent of the absolute response magnitude. This is necessary for cross-blend comparison because slabs within the same blend carry different per-slab calibration depths $z_{\text{thresh},B_{18}}$, producing loading curves of different scales. The slab-level HI is the mean over all cycles recorded for that slab.
+Normalization by $A^{L}$ renders HI dimensionless and independent of absolute force magnitude, enabling cross-blend comparison despite the large inter-blend stiffness range.
 
-### H.3 Sign Convention
+### H.5 Loop Closure at Zero Depth
 
-For viscoelastic elastomers measured in displacement space, the unloading curve characteristically lies above the loading curve at equivalent penetration depths. At a given depth during retraction, the material has not yet fully recovered, and markers remain more displaced than at the same depth during approach. The result is $A^{U} > A^{L}$, yielding a negative HI. The signed HI is retained in all analyses; the sign conveys the directional interpretation of the hysteresis loop in the sensor's output space.
+For display purposes only, the point $(p = 0\ \text{mm},\ f = 0\ \text{mN})$ is prepended to the unloading curve before plotting, reflecting the physical boundary condition that zero contact force implies zero penetration depth. This point is appended after HI computation (§H.4) and does not affect the metric.
+
+### H.6 Sign Convention
+
+In force–displacement space, the loading curve lies above the unloading curve at equivalent penetration depths: the force required to reach a given depth on approach exceeds the force sustained at that depth on retraction, as the viscoelastic material has partially relaxed during the cycle. This yields $A^{L} > A^{U}$ and a positive HI — the physically expected result for an energy-dissipating viscoelastic solid. A negative value indicates an inversion artifact, typically caused by uncorrected backlash, which shifts the unloading curve leftward and raises its apparent area above the loading curve area. Following backlash correction, all four blends yielded positive HI values (11–13%), confirming physically consistent energy dissipation behaviour.
+
+### H.7 Inter-Slab Variability
+
+Absolute peak force at 6 mm depth varied substantially across replicates of the same blend, most prominently in B2 (75:25 Ecoflex:Sylgard 186), where one slab reached approximately 600 mN while the remaining two reached 130–150 mN — a roughly four-fold spread. B1 (100:0) and B4 (25:75) each exhibited one outlier replicate (n3) that was measurably softer than the other two. This variability is attributed to batch-to-batch inconsistency in hand-mixed elastomer preparation: small deviations in mixing ratio by mass, incomplete vacuum degassing, and cure-condition variation between casting sessions. Despite the stiffness spread, the hysteresis index remained consistent across replicates (SD $\leq$ 3.2% across all blends), indicating that energy dissipation behaviour is a more reproducible material property than absolute stiffness under these preparation conditions. The blend-level HI reported in the scoring matrix is the mean over $n = 3$ slab replicates.
 
 ---
 
