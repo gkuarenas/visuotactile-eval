@@ -91,23 +91,25 @@ def _load_hysteresis_slab(sdir):
 
         # Drop backlash-zone points that landed at or beyond pen_max after the
         # shift (they were recorded while the carriage was still at max depth).
-        # Then prepend the exact loading turnaround point so the two curves share
-        # a common endpoint at the top — physically they must, since the direction
-        # reversal is instantaneous.
         udf = udf[udf["pen"] < pen_max].copy()
+
+        # Smooth and clip BEFORE capturing the turnaround point so both curves
+        # share exactly the same force value at pen_max.  Rolling edge effects at
+        # the last point would otherwise shift each curve independently, leaving a
+        # visible gap at max depth even though the turnaround row was prepended.
+        ldf["force_n"] = ldf["force_n"].rolling(5, center=True, min_periods=1).mean()
+        udf["force_n"] = udf["force_n"].rolling(5, center=True, min_periods=1).mean()
+        ldf["force_n"] = ldf["force_n"].clip(lower=0)
+        udf["force_n"] = udf["force_n"].clip(lower=0)
+
+        # Prepend the exact (smoothed) loading turnaround point so the two curves
+        # share a common endpoint at max depth — physically they must, since the
+        # direction reversal is instantaneous.
         turnaround_f = float(ldf.loc[ldf["pen"].idxmax(), "force_n"])
         udf = pd.concat(
             [pd.DataFrame({"pen": [pen_max], "force_n": [turnaround_f]}), udf],
             ignore_index=True,
         ).sort_values("pen").reset_index(drop=True)
-
-        # Smooth over a 5-step rolling window to reduce load-cell noise (~2 mN).
-        ldf["force_n"] = ldf["force_n"].rolling(5, center=True, min_periods=1).mean()
-        udf["force_n"] = udf["force_n"].rolling(5, center=True, min_periods=1).mean()
-
-        # Clip to zero — physically impossible to have negative contact force.
-        ldf["force_n"] = ldf["force_n"].clip(lower=0)
-        udf["force_n"] = udf["force_n"].clip(lower=0)
 
         area_l = float(_trapz(ldf["force_n"].values, ldf["pen"].values))
         area_u = float(_trapz(udf["force_n"].values, udf["pen"].values))
