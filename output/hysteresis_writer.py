@@ -163,9 +163,6 @@ def plot_hysteresis_loops(
                     label=f"{spd_label}Loading")
             ax.plot(pen_grid, mean_unload, "--", color=color, lw=0.8,
                     label=f"{spd_label}Unloading")
-            ax.plot([pen_grid[-1], pen_grid[-1]],
-                    [mean_load[-1], mean_unload[-1]],
-                    "-", color=color, lw=0.8)
 
         # HI annotation: use per-speed values when a single speed is displayed
         if len(speeds) == 1:
