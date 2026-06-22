@@ -331,6 +331,7 @@ class SensitivityWindow(ctk.CTk):
         self._hy_session_ts  = ""
         self._hy_z_retract_mm  = 5.0
         self._hy_max_depth_mm  = _HY_MAX_DEPTH_MM
+        self._hy_backlash_mm   = 0.0
         self._hy_writer: Optional[HysteresisWriter] = None
         self._hy_bins_completed: list[int] = []
         self._hy_bins_skipped:   list[int] = []
@@ -917,6 +918,13 @@ class SensitivityWindow(ctk.CTk):
         ctk.CTkEntry(setup, textvariable=self._hy_max_depth_var, width=70).grid(
             row=3, column=1, padx=(0, 4), pady=2, sticky="w"
         )
+        ctk.CTkLabel(setup, text="Backlash Z (mm):", anchor="e").grid(
+            row=4, column=0, padx=(4, 2), pady=2, sticky="e"
+        )
+        self._hy_backlash_var = ctk.StringVar(value="0.0")
+        ctk.CTkEntry(setup, textvariable=self._hy_backlash_var, width=70).grid(
+            row=4, column=1, padx=(0, 4), pady=2, sticky="w"
+        )
         speeds_str = "  ".join(str(s) for s in _HY_SPEEDS_MM_S)
         ctk.CTkLabel(
             setup,
@@ -924,7 +932,7 @@ class SensitivityWindow(ctk.CTk):
             font=ctk.CTkFont(family="Courier", size=10),
             anchor="w",
             wraplength=_RIGHT_W - 20,
-        ).grid(row=4, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w")
+        ).grid(row=5, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="w")
 
         btn_row = ctk.CTkFrame(f, fg_color="transparent")
         btn_row.pack(fill="x", padx=8, pady=(0, 4))
@@ -2988,6 +2996,13 @@ class SensitivityWindow(ctk.CTk):
         except ValueError:
             messagebox.showerror("Input Error", "Max Depth must be a positive number.")
             return
+        try:
+            backlash_mm = float(self._hy_backlash_var.get())
+            if backlash_mm < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Input Error", "Backlash Z must be a non-negative number.")
+            return
         if not self._tracker.baseline_set:
             messagebox.showerror("No Baseline",
                                  "Capture Baseline before running the hysteresis test.")
@@ -3002,6 +3017,7 @@ class SensitivityWindow(ctk.CTk):
         self._hy_session_dir    = f"output/sessions/{blend_id}/{ts}_n{sample_num}_hysteresis"
         self._hy_z_retract_mm   = z_retract
         self._hy_max_depth_mm   = max_depth
+        self._hy_backlash_mm    = backlash_mm
         self._hy_bins_completed = []
         self._hy_bins_skipped   = []
         self._hy_per_bin_status = {}
@@ -3154,6 +3170,15 @@ class SensitivityWindow(ctk.CTk):
         self._retare_scale_if_connected()
         time.sleep(0.5)
 
+        # Enable Marlin backlash compensation if a non-zero value was entered.
+        # If the firmware was not compiled with BACKLASH_COMPENSATION, Marlin
+        # returns "echo:Unknown command" but still sends "ok", so the sweep
+        # proceeds unchanged and the user can fall back to post-processing correction.
+        backlash_mm = self._hy_backlash_mm
+        if backlash_mm > 0.0:
+            self._hy_post("progress", f"Enabling M425 backlash compensation Z={backlash_mm:.3f} mm…")
+            self._ender_sync_cmd(f"M425 F1 Z{backlash_mm:.3f}", timeout=5.0)
+
         sweep_aborted = False
 
         for speed_idx, speed_mm_s in enumerate(_HY_SPEEDS_MM_S):
@@ -3191,9 +3216,11 @@ class SensitivityWindow(ctk.CTk):
         if self._hy_writer is not None:
             self._hy_writer.close()
 
-        # Restore Z kinematics to Ender 3 defaults regardless of outcome
+        # Restore Z kinematics and backlash setting to Ender 3 defaults
         self._ender_sync_cmd("M201 Z100", timeout=5.0)
         self._ender_sync_cmd("M203 Z5",   timeout=5.0)
+        if backlash_mm > 0.0:
+            self._ender_sync_cmd("M425 F0", timeout=5.0)
 
         if not sweep_aborted and not self._hy_stop_ev.is_set():
             self._ender_sync_cmd(f"G1 Z{_CLEARANCE_Z_MM:.3f} F300", timeout=30.0)
