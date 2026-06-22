@@ -115,7 +115,6 @@ def plot_hysteresis_loops(
         return
 
     prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    speed_colors = {s: prop_cycle[i % len(prop_cycle)] for i, s in enumerate(speeds)}
 
     N = len(loaded)
     ncols = min(N, 2)
@@ -134,12 +133,9 @@ def plot_hysteresis_loops(
             if s.get("HI_mean") is not None and not np.isnan(float(s["HI_mean"]))
         ]
 
-        for speed in speeds:
-            color = speed_colors[speed]
-            spd_label = f"{speed} mm/s — " if len(speeds) > 1 else ""
-
-            first = True
-            for slab in slabs:
+        for slab_idx, slab in enumerate(slabs):
+            color = prop_cycle[slab_idx % len(prop_cycle)]
+            for speed in speeds:
                 sc = slab.get("per_speed", {}).get(speed)
                 if sc is None:
                     continue
@@ -147,14 +143,10 @@ def plot_hysteresis_loops(
                 uc = sc["unload_curve"].sort_values("pen")
                 if lc.empty or uc.empty:
                     continue
-
                 ax.plot(lc["pen"].values, lc["force_n"].values * 1000.0,
-                        "-",  color=color, lw=0.8, alpha=0.6,
-                        label=f"{spd_label}Loading"   if first else "_nolegend_")
+                        "-",  color=color, lw=0.8, alpha=0.7)
                 ax.plot(uc["pen"].values, uc["force_n"].values * 1000.0,
-                        "--", color=color, lw=0.8, alpha=0.6,
-                        label=f"{spd_label}Unloading" if first else "_nolegend_")
-                first = False
+                        "--", color=color, lw=0.8, alpha=0.7)
 
         # HI annotation: use per-speed values when a single speed is displayed
         if len(speeds) == 1:
@@ -184,9 +176,14 @@ def plot_hysteresis_loops(
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
 
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(handles, labels, fontsize=fontsize_legend, ncol=1, loc="upper left")
+        if slabs:
+            legend_handles = [
+                Line2D([0], [0], color=prop_cycle[i % len(prop_cycle)], lw=0.8,
+                       label=f"n{i + 1}")
+                for i in range(len(slabs))
+            ]
+            ax.legend(handles=legend_handles, fontsize=fontsize_legend,
+                      loc="upper left", framealpha=0.8)
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
