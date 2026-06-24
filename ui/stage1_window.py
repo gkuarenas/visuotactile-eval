@@ -148,29 +148,6 @@ _HY_POLL_WINDOW_S     = 0.1    # 100 ms HX711 averaging window (~1–2 readings 
 
 # ── Module helpers ────────────────────────────────────────────────────────────
 
-def compute_grid_positions() -> list[tuple[int, float, float]]:
-    """Return 9 (bin_id, x_mm, y_mm) tuples — the centroids of a 3x3 division
-    of the working area (35.2 x 27.2 mm, i.e. +-17.6 mm X / +-13.6 mm Y),
-    replacing the 5-position protocol for finer spatial sensitivity/uniformity
-    sampling. Origin (0,0) is slab centre, but sensitivity_analysis.ipynb's
-    marker-baseline-vs-bin plot showed the camera is not perfectly centred on
-    the slab, so the whole grid is translated 1.2 mm in -Y to keep the
-    boundary elastomers in bins 7-9 inside their intended cells. Visit order:
-    row-major, top-left -> bottom-right.
-    """
-    return [
-        (1, -11.733,   7.867),
-        (2,   0.0,     7.867),
-        (3,  11.733,   7.867),
-        (4, -11.733,  -1.2),
-        (5,   0.0,    -1.2),
-        (6,  11.733,  -1.2),
-        (7, -11.733, -10.267),
-        (8,   0.0,   -10.267),
-        (9,  11.733, -10.267),
-    ]
-
-
 def compute_grid_positions_7x5() -> list[dict]:
     """Return 35 bin dicts {bin_id, col, row, x_mm, y_mm} — a 7 (cols) x 5 (rows)
     division of the working area (35.2 x 27.2 mm), bin size ~5.029 x 5.44 mm.
