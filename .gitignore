@@ -46,6 +46,7 @@ desktop.ini
 output/sessions/
 output/figures
 docs/
+.claude/
 *.avi
 *.mp4
 *.mkv
