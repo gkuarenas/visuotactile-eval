@@ -60,3 +60,4 @@ logs/
 
 # ── Specific Files ───────────────────────────────────────────────────
 generate_docs.py
+CLAUDE.md
