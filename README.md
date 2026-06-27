@@ -1,6 +1,6 @@
 # visuotactile-eval
 
-A low-cost open-source framework for characterizing visuotactile tactile sensors via phantom-based deformation screening. Implements sensitivity, stability, and hysteresis test protocols with automated marker tracking, motorized indentation, and load-cell telemetry.
+A low-cost framework for characterizing visuotactile tactile sensors via phantom-based deformation screening. Implements sensitivity, stability, and hysteresis test protocols with automated marker tracking, motorized indentation, and load-cell telemetry.
 
 Developed as part of a DLSU thesis on the GripVT visuotactile forearm sensor. Intended as an accessible alternative to commercial evaluation systems (e.g. TacEva).
 
