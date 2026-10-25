@@ -62,3 +62,6 @@ logs/
 # ── Specific Files ───────────────────────────────────────────────────
 generate_docs.py
 CLAUDE.md
+# Keep README images tracked despite the image ignores above
+!assets/
+!assets/**
